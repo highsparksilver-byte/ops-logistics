@@ -1,28 +1,25 @@
-const express = require("express");
-const axios = require("axios");
+import express from "express";
+import axios from "axios";
 
 const app = express();
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
-// 🔐 Render environment variables
+// 🔐 Environment variables (set in Render)
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 const LOGIN_ID = process.env.LOGIN_ID;
-const LICENSE_KEY = process.env.LICENSE_KEY;
+const LICENCE_KEY = process.env.LICENCE_KEY;
 
-console.log("Server starting...");
+// Safety check
+if (!CLIENT_ID || !CLIENT_SECRET || !LOGIN_ID || !LICENCE_KEY) {
+  console.error("Missing environment variables");
+}
 
-// Health check
-app.get("/", (req, res) => {
-  res.send("Server alive");
-});
-
-// Token cache
+// Cache JWT token
 let cachedToken = null;
-let tokenExpiry = null;
+let tokenExpiry = 0;
 
-// 🔐 AUTH — EXACTLY as per generateJWT_0.yaml
+// 🔑 Generate JWT Token
 async function getToken() {
   if (cachedToken && Date.now() < tokenExpiry) {
     return cachedToken;
@@ -44,17 +41,17 @@ async function getToken() {
   return cachedToken;
 }
 
-// 🚚 EDD API (Transit Time)
+// 📦 EDD API
 app.post("/edd", async (req, res) => {
   try {
-    console.log("EDD request received");
+    const { pincode } = req.body;
 
-    const toPincode =
-      req.body.pincode || req.query.pincode || "411022";
+    if (!pincode) {
+      return res.status(400).json({ error: "Pincode required" });
+    }
 
     const token = await getToken();
 
-    // YYYYMMDD
     const today = new Date()
       .toISOString()
       .slice(0, 10)
@@ -63,38 +60,48 @@ app.post("/edd", async (req, res) => {
     const response = await axios.post(
       "https://apigateway.bluedart.com/in/transportation/transit-time/v1/GetDomesticTransitTimeForPinCodeandProduct",
       {
-        ppinCode: "411022",
-        pPinCodeTo: toPincode,
+        pPinCodeFrom: "411022", // default origin pincode
+        pPinCodeTo: pincode,
         pProductCode: "A",
         pSubProductCode: "P",
         pPudate: today,
-        pPickupTime: "1400"
+        pPickupTime: "1600",
+        profile: {
+          Api_type: "T",
+          LicenceKey: LICENCE_KEY,
+          LoginID: LOGIN_ID
+        }
       },
       {
         headers: {
           Authorization: `Bearer ${token}`,
-          LoginID: LOGIN_ID,
-          LicenseKey: LICENSE_KEY,
-          Accept: "application/json",
-          "Content-Type": "application/json"
+          "Content-Type": "application/json",
+          Accept: "application/json"
         }
       }
     );
 
     const edd =
-      response.data?.DomesticTranistTimeReference?.ExpectedDateDelivery;
+      response.data?.GetDomesticTransitTimeForPinCodeandProductResult
+        ?.ExpectedDateDelivery;
 
     res.json({ edd });
-  } catch (e) {
-    console.error("EDD ERROR:", e.response?.data || e.message);
-    res.status(500).json({
-      error: "EDD unavailable",
-      details: e.response?.data || e.message
-    });
+  } catch (error) {
+    console.error(
+      "EDD ERROR:",
+      error.response?.data || error.message
+    );
+    res.status(500).json({ error: "EDD unavailable" });
   }
 });
 
+// ✅ Health check
+app.get("/", (req, res) => {
+  res.send("Blue Dart EDD server running");
+});
+
+// Render uses dynamic PORT
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log("Server running on port", PORT);
+  console.log("Server started on port", PORT);
 });
