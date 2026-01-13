@@ -4,22 +4,80 @@ import axios from "axios";
 const app = express();
 app.use(express.json());
 
-// 🔴 HARD-CODED — THIS IS WHAT WORKED
-// Use a FRESH JWT generated from Blue Dart portal
-const JWT_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzdWJqZWN0LXN1YmplY3QiLCJhdWQiOlsiYXVkaWVuY2UxIiwiYXVkaWVuY2UyIl0sImlzcyI6InVybjovL2FwaWdlZS1lZGdlLUpXVC1wb2xpY3ktdGVzdCIsImV4cCI6MTc2ODQwOTYwNSwiaWF0IjoxNzY4MzIzMjA1LCJqdGkiOiI5MGExZjQ2ZS00NzMzLTQ1OTAtODFjOS04YWUxZGNiYWZhZWMifQ.NIQDd34M0YDSbm5anjaEg0PXfK5Tn32Md9gguGQ5enI";
+/*
+================================================
+ 🔴 HARD-CODED CREDENTIALS (TEST ONLY)
+================================================
+*/
 
-// These MUST match the same account that generated the JWT
-const LOGIN_ID = "PNQ90609";              // example – replace with yours
-const LICENCE_KEY = "oupkkkosmeqmuqqfsph8korrp8krmouj";   // replace with yours
+// 🔑 Blue Dart App credentials (SAME app as portal)
+const CLIENT_ID = "e8t8RyuHO1rNqZ6GCBsjRoqeokRoCefb";
+const CLIENT_SECRET = "J8qusC0Ra0zpDmbH";
 
-// Legacy date format (required)
-function legacyDate() {
+// 🔑 Account credentials (same app/account)
+const LOGIN_ID = "PNQ90609";
+const LICENCE_KEY = "oupkkkosmeqmuqqfsph8korrp8krmouj";
+
+/*
+================================================
+ JWT handling (dynamic, cached)
+================================================
+*/
+
+let cachedJwt = null;
+let jwtExpiry = 0;
+
+async function getJwtToken() {
+  // reuse token if valid
+  if (cachedJwt && Date.now() < jwtExpiry) {
+    return cachedJwt;
+  }
+
+  console.log("🔐 Generating new JWT");
+
+  const res = await axios.get(
+    "https://apigateway.bluedart.com/in/transportation/token/v1/login",
+    {
+      headers: {
+        ClientID: CLIENT_ID,
+        clientSecret: CLIENT_SECRET,
+        Accept: "application/json"
+      }
+    }
+  );
+
+  if (!res.data?.JWTToken) {
+    throw new Error("JWTToken not returned by Blue Dart");
+  }
+
+  cachedJwt = res.data.JWTToken;
+  jwtExpiry = Date.now() + 23 * 60 * 60 * 1000; // ~23 hours
+
+  console.log("✅ JWT generated");
+  return cachedJwt;
+}
+
+/*
+================================================
+ Helpers
+================================================
+*/
+
+// Legacy date format REQUIRED by /transit/v1
+function legacyDateNow() {
   return `/Date(${Date.now()})/`;
 }
 
-// ✅ THIS ENDPOINT WORKED
+/*
+================================================
+ EDD API (LEGACY – PROVEN WORKING)
+================================================
+*/
+
 app.post("/edd", async (req, res) => {
   try {
+    const jwt = await getJwtToken();
+
     const response = await axios.post(
       "https://apigateway.bluedart.com/in/transportation/transit/v1/GetDomesticTransitTimeForPinCodeandProduct",
       {
@@ -27,7 +85,7 @@ app.post("/edd", async (req, res) => {
         pPinCodeTo: "400099",
         pProductCode: "A",
         pSubProductCode: "P",
-        pPudate: legacyDate(),
+        pPudate: legacyDateNow(),
         pPickupTime: "16:00",
         profile: {
           Api_type: "S",
@@ -37,7 +95,7 @@ app.post("/edd", async (req, res) => {
       },
       {
         headers: {
-          JWTToken: JWT_TOKEN,
+          JWTToken: jwt,
           "Content-Type": "application/json",
           Accept: "application/json"
         }
@@ -45,7 +103,14 @@ app.post("/edd", async (req, res) => {
     );
 
     res.json(response.data);
+
   } catch (error) {
+    console.error("❌ ERROR", {
+      status: error.response?.status,
+      data: error.response?.data,
+      message: error.message
+    });
+
     res.status(500).json({
       error: "FAILED",
       status: error.response?.status,
@@ -54,10 +119,22 @@ app.post("/edd", async (req, res) => {
   }
 });
 
+/*
+================================================
+ Health Check
+================================================
+*/
+
 app.get("/", (req, res) => {
-  res.send("Blue Dart EDD server running (known-good version)");
+  res.send("Blue Dart EDD server running (hard-coded JWT generation)");
 });
 
+/*
+================================================
+ Start Server
+================================================
+*/
+
 app.listen(3000, () => {
-  console.log("Server running on port 3000");
+  console.log("🚀 Server running on port 3000");
 });
