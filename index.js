@@ -1,115 +1,33 @@
-import express from "express";
-import axios from "axios";
+Ill add some stuff for reference - 
 
-const app = express();
-app.use(express.json());
+it says on bluedart portal - 
 
-// 🔐 Environment variables (Render)
-const CLIENT_ID = process.env.CLIENT_ID;
-const CLIENT_SECRET = process.env.CLIENT_SECRET;
-const LOGIN_ID = process.env.LOGIN_ID;
-const LICENCE_KEY = process.env.LICENCE_KEY;
 
-// Sanity check
-if (!CLIENT_ID || !CLIENT_SECRET || !LOGIN_ID || !LICENCE_KEY) {
-  console.error("❌ Missing environment variables");
-} else {
-  console.log("✅ Environment variables loaded");
-}
+curl --location 'https://apigateway-sandbox.bluedart.com/in/transportation/transit/v1/GetDomesticTransitTimeForPinCodeandProduct' \
+--header 'content-type: application/json' \
+--header 'JWTToken: REPLACE_KEY_VALUE' \
+--data '{"pPinCodeTo":"string","pPickupTime":"string","pPinCodeFrom":"string","profile":{"LoginID":"string","Api_type":"T","LicenceKey":"string"},"pProductCode":"string","pPudate":"string","pSubProductCode":"s"}'
 
-// 🔑 Generate JWT token (NO caching for now – avoids gateway edge cases)
-async function getToken() {
-  console.log("🔐 Generating JWT token");
 
-  const response = await axios.get(
-    "https://apigateway.bluedart.com/in/transportation/token/v1/login",
-    {
-      headers: {
-        ClientID: CLIENT_ID,
-        clientSecret: CLIENT_SECRET,
-        Accept: "application/json"
-      }
-    }
-  );
-
-  if (!response.data?.JWTToken) {
-    throw new Error("JWTToken missing in auth response");
+curl -X 'POST' \
+  'https://apigateway.bluedart.com/in/transportation/transit/v1/GetDomesticTransitTimeForPinCodeandProduct' \
+  -H 'accept: application/json' \
+  -H 'JWTToken: eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzdWJqZWN0LXN1YmplY3QiLCJhdWQiOlsiYXVkaWVuY2UxIiwiYXVkaWVuY2UyIl0sImlzcyI6InVybjovL2FwaWdlZS1lZGdlLUpXVC1wb2xpY3ktdGVzdCIsImV4cCI6MTc2ODQwOTYwNSwiaWF0IjoxNzY4MzIzMjA1LCJqdGkiOiI5MGExZjQ2ZS00NzMzLTQ1OTAtODFjOS04YWUxZGNiYWZhZWMifQ.NIQDd34M0YDSbm5anjaEg0PXfK5Tn32Md9gguGQ5enI' \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "pPinCodeFrom": "411022",
+  "pPinCodeTo": "400099",
+  "pProductCode": "A",
+  "pSubProductCode": "P",
+  "pPudate": "/Date(1653571901000)/",
+  "pPickupTime": "16:00",
+  "profile": {
+    "Api_type": "S",
+    "LicenceKey": "oupkkkosmeqmuqqfsph8korrp8krmouj",
+    "LoginID": "PNQ90609"
   }
+}'
 
-  return response.data.JWTToken;
-}
 
-// 📦 EDD endpoint
-app.post("/edd", async (req, res) => {
-  try {
-    const { pincode } = req.body;
-
-    if (!pincode) {
-      return res.status(400).json({ error: "Pincode required" });
-    }
-
-    const token = await getToken();
-
-    const today = new Date()
-      .toISOString()
-      .slice(0, 10)
-      .replace(/-/g, "");
-
-    console.log("🚚 Calling Blue Dart Transit Time API");
-
-    const response = await axios.post(
-      "https://apigateway.bluedart.com/in/transportation/transit-time/v1/GetDomesticTransitTimeForPinCodeandProduct",
-      {
-        pPinCodeFrom: "411022",
-        pPinCodeTo: pincode,
-        pProductCode: "A",
-        pSubProductCode: "P",
-        pPudate: today,
-        pPickupTime: "1600",
-        profile: {
-          Api_type: "T",
-          LicenceKey: LICENCE_KEY,
-          LoginID: LOGIN_ID
-        }
-      },
-      {
-        headers: {
-          // ✅ BOTH headers — this is the key
-          JWTToken: token,
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-          Accept: "application/json"
-        }
-      }
-    );
-
-    const result =
-      response.data?.GetDomesticTransitTimeForPinCodeandProductResult;
-
-    console.log("✅ Blue Dart response:", result);
-
-    res.json({
-      edd: result?.ExpectedDateDelivery
-    });
-  } catch (error) {
-    console.error("❌ EDD ERROR:", {
-      status: error.response?.status,
-      data: error.response?.data
-    });
-
-    res.status(500).json({
-      error: "EDD unavailable",
-      details: error.response?.data || error.message
-    });
-  }
-});
-
-// Health check
-app.get("/", (req, res) => {
-  res.send("Blue Dart EDD server running");
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("🚀 Server running on port", PORT);
-});
+Request URL
+https://apigateway.bluedart.com/in/transportation/transit/v1/GetDomesticTransitTimeForPinCodeandProduct
