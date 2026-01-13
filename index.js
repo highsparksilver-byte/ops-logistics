@@ -6,87 +6,43 @@ app.use(express.json());
 
 /*
 ================================================
- 🔴 HARD-CODED CREDENTIALS (TEST ONLY)
+ 🔴 MANUAL JWT MODE (STABLE)
 ================================================
 */
 
-// 🔑 Blue Dart App credentials (SAME app as portal)
-const CLIENT_ID = "e8t8RyuHO1rNqZ6GCBsjRoqeokRoCefb";
-const CLIENT_SECRET = "J8qusC0Ra0zpDmbH";
+// 🔑 PASTE JWT GENERATED FROM BLUEDART PORTAL (VALID ~24 HRS)
+const JWT_TOKEN =
+"PASTE_FRESH_JWT_HERE";
 
-// 🔑 Account credentials (same app/account)
-const LOGIN_ID = "PNQ90609";
-const LICENCE_KEY = "oupkkkosmeqmuqqfsph8korrp8krmouj";
+// 🔑 These MUST belong to SAME account/app
+const LOGIN_ID = "PNQ90609";              // replace with yours
+const LICENCE_KEY = "PASTE_LICENCE_KEY";  // replace with yours
 
 /*
 ================================================
- JWT handling (dynamic, cached)
+ Helper (legacy format REQUIRED)
 ================================================
 */
-
-let cachedJwt = null;
-let jwtExpiry = 0;
-
-async function getJwtToken() {
-  // reuse token if valid
-  if (cachedJwt && Date.now() < jwtExpiry) {
-    return cachedJwt;
-  }
-
-  console.log("🔐 Generating new JWT");
-
-  const res = await axios.get(
-    "https://apigateway.bluedart.com/in/transportation/token/v1/login",
-    {
-      headers: {
-        ClientID: CLIENT_ID,
-        clientSecret: CLIENT_SECRET,
-        Accept: "application/json"
-      }
-    }
-  );
-
-  if (!res.data?.JWTToken) {
-    throw new Error("JWTToken not returned by Blue Dart");
-  }
-
-  cachedJwt = res.data.JWTToken;
-  jwtExpiry = Date.now() + 23 * 60 * 60 * 1000; // ~23 hours
-
-  console.log("✅ JWT generated");
-  return cachedJwt;
-}
-
-/*
-================================================
- Helpers
-================================================
-*/
-
-// Legacy date format REQUIRED by /transit/v1
 function legacyDateNow() {
   return `/Date(${Date.now()})/`;
 }
 
 /*
 ================================================
- EDD API (LEGACY – PROVEN WORKING)
+ EDD ENDPOINT (PROVEN WORKING)
 ================================================
 */
-
 app.post("/edd", async (req, res) => {
   try {
-    const jwt = await getJwtToken();
-
     const response = await axios.post(
       "https://apigateway.bluedart.com/in/transportation/transit/v1/GetDomesticTransitTimeForPinCodeandProduct",
       {
-        pPinCodeFrom: "411022",
-        pPinCodeTo: "400099",
+        pPinCodeFrom: "411022",     // origin
+        pPinCodeTo: "400099",       // destination (can be dynamic later)
         pProductCode: "A",
         pSubProductCode: "P",
-        pPudate: legacyDateNow(),
-        pPickupTime: "16:00",
+        pPudate: legacyDateNow(),   // legacy date format
+        pPickupTime: "16:00",       // legacy time format
         profile: {
           Api_type: "S",
           LicenceKey: LICENCE_KEY,
@@ -95,7 +51,7 @@ app.post("/edd", async (req, res) => {
       },
       {
         headers: {
-          JWTToken: jwt,
+          JWTToken: JWT_TOKEN,
           "Content-Type": "application/json",
           Accept: "application/json"
         }
@@ -105,12 +61,6 @@ app.post("/edd", async (req, res) => {
     res.json(response.data);
 
   } catch (error) {
-    console.error("❌ ERROR", {
-      status: error.response?.status,
-      data: error.response?.data,
-      message: error.message
-    });
-
     res.status(500).json({
       error: "FAILED",
       status: error.response?.status,
@@ -124,9 +74,8 @@ app.post("/edd", async (req, res) => {
  Health Check
 ================================================
 */
-
 app.get("/", (req, res) => {
-  res.send("Blue Dart EDD server running (hard-coded JWT generation)");
+  res.send("Blue Dart EDD server running (manual JWT mode)");
 });
 
 /*
@@ -134,7 +83,6 @@ app.get("/", (req, res) => {
  Start Server
 ================================================
 */
-
 app.listen(3000, () => {
   console.log("🚀 Server running on port 3000");
 });
