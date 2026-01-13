@@ -6,27 +6,28 @@ app.use(express.json());
 
 /*
 ================================================
- 🔴 MANUAL JWT MODE (STABLE)
+ 🔴 MANUAL JWT MODE (STABLE & WORKING)
 ================================================
 */
 
-// 🔑 JWT generated manually from Blue Dart Portal (valid ~24 hrs)
+// 🔑 Paste FRESH JWT from Blue Dart Portal (valid ~24 hrs)
 const JWT_TOKEN =
-"eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzdWJqZWN0LXN1YmplY3QiLCJhdWQiOlsiYXVkaWVuY2UxIiwiYXVkaWVuY2UyIl0sImlzcyI6InVybjovL2FwaWdlZS1lZGdlLUpXVC1wb2xpY3ktdGVzdCIsImV4cCI6MTc2ODQwOTYwNSwiaWF0IjoxNzY4MzIzMjA1LCJqdGkiOiI5MGExZjQ2ZS00NzMzLTQ1OTAtODFjOS04YWUxZGNiYWZhZWMifQ.NIQDd34M0YDSbm5anjaEg0PXfK5Tn32Md9gguGQ5enI";
+"PASTE_FRESH_JWT_FROM_PORTAL_HERE";
 
-// 🔐 Sensitive account info from environment
-const LOGIN_ID = process.env.LOGIN_ID;
-const LICENCE_KEY = process.env.LICENCE_KEY;
+// 🔐 Read from environment AND TRIM (CRITICAL)
+const LOGIN_ID = process.env.LOGIN_ID?.trim();
+const LICENCE_KEY = process.env.LICENCE_KEY?.trim();
 
-// Startup sanity check
+// Startup sanity logs
 console.log("🚀 Blue Dart EDD server starting");
 console.log("Env check:", {
   LOGIN_ID: !!LOGIN_ID,
-  LICENCE_KEY: !!LICENCE_KEY
+  LICENCE_KEY: !!LICENCE_KEY,
+  JWT_LENGTH: JWT_TOKEN.length
 });
 
 if (!LOGIN_ID || !LICENCE_KEY) {
-  console.error("❌ LOGIN_ID or LICENCE_KEY missing in environment");
+  console.error("❌ LOGIN_ID or LICENCE_KEY missing or empty");
 }
 
 /*
@@ -47,17 +48,22 @@ function legacyDateNow() {
 */
 app.post("/edd", async (req, res) => {
   try {
+    const { pincode } = req.body;
+
+    // default if not sent (safe for now)
+    const destinationPincode = pincode || "400099";
+
     const response = await axios.post(
       "https://apigateway.bluedart.com/in/transportation/transit/v1/GetDomesticTransitTimeForPinCodeandProduct",
       {
-        pPinCodeFrom: "411022",     // origin pincode
-        pPinCodeTo: "400099",       // destination (can be dynamic later)
+        pPinCodeFrom: "411022",           // origin
+        pPinCodeTo: destinationPincode,  // destination
         pProductCode: "A",
         pSubProductCode: "P",
-        pPudate: legacyDateNow(),   // legacy format
-        pPickupTime: "16:00",       // legacy format
+        pPudate: legacyDateNow(),         // legacy format
+        pPickupTime: "16:00",             // legacy format
         profile: {
-          Api_type: "S",
+          Api_type: "S",                  // legacy API type
           LicenceKey: LICENCE_KEY,
           LoginID: LOGIN_ID
         }
@@ -98,7 +104,7 @@ app.post("/edd", async (req, res) => {
 ================================================
 */
 app.get("/", (req, res) => {
-  res.send("Blue Dart EDD server running (manual JWT, env creds)");
+  res.send("Blue Dart EDD server running (manual JWT + env trim)");
 });
 
 /*
