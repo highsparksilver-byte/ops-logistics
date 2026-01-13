@@ -4,51 +4,21 @@ import axios from "axios";
 const app = express();
 app.use(express.json());
 
-// Environment variables (must be set in Render)
-const CLIENT_ID = process.env.CLIENT_ID;
-const CLIENT_SECRET = process.env.CLIENT_SECRET;
+// 🔴 PASTE A WORKING JWT TOKEN FROM PORTAL HERE
+const HARDCODED_JWT =
+  "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzdWJqZWN0LXN1YmplY3QiLCJhdWQiOlsiYXVkaWVuY2UxIiwiYXVkaWVuY2UyIl0sImlzcyI6InVybjovL2FwaWdlZS1lZGdlLUpXVC1wb2xpY3ktdGVzdCIsImV4cCI6MTc2ODQwOTYwNSwiaWF0IjoxNzY4MzIzMjA1LCJqdGkiOiI5MGExZjQ2ZS00NzMzLTQ1OTAtODFjOS04YWUxZGNiYWZhZWMifQ.NIQDd34M0YDSbm5anjaEg0PXfK5Tn32Md9gguGQ5enI";
+
+// 🔴 Blue Dart account credentials (still required)
 const LOGIN_ID = process.env.LOGIN_ID;
 const LICENCE_KEY = process.env.LICENCE_KEY;
 
-// Basic startup log
-console.log("Starting Blue Dart EDD test server");
-console.log("Env check:", {
-  CLIENT_ID: !!CLIENT_ID,
-  CLIENT_SECRET: !!CLIENT_SECRET,
-  LOGIN_ID: !!LOGIN_ID,
-  LICENCE_KEY: !!LICENCE_KEY
-});
+console.log("Starting Blue Dart HARD JWT test server");
 
-// 🔴 DO NOT CACHE TOKEN — portal does not cache
-async function generateToken() {
-  const res = await axios.get(
-    "https://apigateway.bluedart.com/in/transportation/token/v1/login",
-    {
-      headers: {
-        ClientID: CLIENT_ID,
-        clientSecret: CLIENT_SECRET,
-        Accept: "application/json"
-      }
-    }
-  );
-
-  if (!res.data?.JWTToken) {
-    throw new Error("JWTToken not returned from auth API");
-  }
-
-  return res.data.JWTToken;
-}
-
-// 🔍 EXACT PORTAL REPLICATION ENDPOINT
+// 🔍 TEST ENDPOINT
 app.post("/edd", async (req, res) => {
   try {
-    console.log("---- /edd TEST CALL START ----");
+    console.log("Calling Blue Dart with hardcoded JWT");
 
-    // 1️⃣ Generate JWT
-    const token = await generateToken();
-    console.log("JWT generated");
-
-    // 2️⃣ Call SAME API portal uses (NEW transit-time API)
     const response = await axios.post(
       "https://apigateway.bluedart.com/in/transportation/transit-time/v1/GetDomesticTransitTimeForPinCodeandProduct",
       {
@@ -66,25 +36,18 @@ app.post("/edd", async (req, res) => {
       },
       {
         headers: {
-          // ⚠️ EXACTLY what portal sends
-          JWTToken: token,
+          JWTToken: HARDCODED_JWT,
           "Content-Type": "application/json",
           Accept: "application/json"
         }
       }
     );
 
-    console.log("Blue Dart response OK");
-
-    // 3️⃣ Return raw response (no processing)
     res.json(response.data);
   } catch (error) {
-    console.error("❌ FAILURE");
-
-    console.error({
+    console.error("❌ HARD JWT TEST FAILED", {
       status: error.response?.status,
-      data: error.response?.data,
-      message: error.message
+      data: error.response?.data
     });
 
     res.status(500).json({
@@ -97,7 +60,7 @@ app.post("/edd", async (req, res) => {
 
 // Health check
 app.get("/", (req, res) => {
-  res.send("Blue Dart EDD test server running");
+  res.send("Hardcoded JWT test server running");
 });
 
 const PORT = process.env.PORT || 3000;
