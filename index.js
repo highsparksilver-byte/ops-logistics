@@ -4,92 +4,73 @@ import axios from "axios";
 const app = express();
 app.use(express.json());
 
-// 🔐 Environment variables (Render)
-const STATIC_JWT = process.env.BLUEDART_JWT;
-const LOGIN_ID = process.env.LOGIN_ID;
-const LICENCE_KEY = process.env.LICENCE_KEY;
+/*
+  🔴 HARD-CODE EVERYTHING BELOW
+  🔴 FOR TESTING ONLY
+*/
 
-// Startup check
-console.log("🚀 Starting Blue Dart EDD server (STATIC JWT MODE)");
-console.log("Env check:", {
-  BLUEDART_JWT: !!STATIC_JWT,
-  LOGIN_ID: !!LOGIN_ID,
-  LICENCE_KEY: !!LICENCE_KEY
-});
+// 1️⃣ Paste JWTToken that WORKED in Portal
+const JWT_TOKEN =
+  "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzdWJqZWN0LXN1YmplY3QiLCJhdWQiOlsiYXVkaWVuY2UxIiwiYXVkaWVuY2UyIl0sImlzcyI6InVybjovL2FwaWdlZS1lZGdlLUpXVC1wb2xpY3ktdGVzdCIsImV4cCI6MTc2ODQwOTYwNSwiaWF0IjoxNzY4MzIzMjA1LCJqdGkiOiI5MGExZjQ2ZS00NzMzLTQ1OTAtODFjOS04YWUxZGNiYWZhZWMifQ.NIQDd34M0YDSbm5anjaEg0PXfK5Tn32Md9gguGQ5enI";
 
-if (!STATIC_JWT || !LOGIN_ID || !LICENCE_KEY) {
-  console.error("❌ Missing required environment variables");
-}
+// 2️⃣ Paste your actual Blue Dart credentials
+const LOGIN_ID = "PNQ90609";
+const LICENCE_KEY = "oupkkkosmeqmuqqfsph8korrp8krmouj";
 
-// Helper: legacy date format required by legacy Transit API
-function legacyDateNow() {
-  return `/Date(${Date.now()})/`;
-}
+console.log("🚨 HARD-CODED TEST MODE ENABLED");
 
-// ─────────────────────────────────────────────
-// EDD endpoint (Shopify will call this)
-// ─────────────────────────────────────────────
+// 🔍 TEST ENDPOINT
 app.post("/edd", async (req, res) => {
   try {
-    const { pincode } = req.body;
+    console.log("📦 Calling Blue Dart with hard-coded credentials");
 
-    if (!pincode) {
-      return res.status(400).json({ error: "Pincode required" });
-    }
-
-    console.log("📦 EDD request for pincode:", pincode);
-
-    const bdRes = await axios.post(
-      // ✅ LEGACY endpoint (this is enabled for your app)
-      "https://apigateway.bluedart.com/in/transportation/transit/v1/GetDomesticTransitTimeForPinCodeandProduct",
+    const response = await axios.post(
+      "https://apigateway.bluedart.com/in/transportation/transit-time/v1/GetDomesticTransitTimeForPinCodeandProduct",
       {
-        pPinCodeFrom: "411022",   // default origin
-        pPinCodeTo: pincode,
+        pPinCodeFrom: "411022",
+        pPinCodeTo: "400099",
         pProductCode: "A",
         pSubProductCode: "P",
-        pPudate: legacyDateNow(), // legacy date format
-        pPickupTime: "16:00",     // legacy time format
+        pPudate: "20260116",
+        pPickupTime: "1600",
         profile: {
-          Api_type: "S",          // legacy API type
+          Api_type: "T",
           LicenceKey: LICENCE_KEY,
           LoginID: LOGIN_ID
         }
       },
       {
         headers: {
-          JWTToken: STATIC_JWT,
+          JWTToken: JWT_TOKEN,
           "Content-Type": "application/json",
           Accept: "application/json"
         }
       }
     );
 
-    const result =
-      bdRes.data?.GetDomesticTransitTimeForPinCodeandProductResult;
+    console.log("✅ Blue Dart responded");
 
-    res.json({
-      edd: result?.ExpectedDateDelivery
-    });
+    res.json(response.data);
   } catch (error) {
-    console.error("❌ EDD ERROR", {
+    console.error("❌ HARD TEST FAILED", {
       status: error.response?.status,
-      data: error.response?.data,
-      message: error.message
+      data: error.response?.data
     });
 
     res.status(500).json({
-      error: "EDD unavailable"
+      error: "FAILED",
+      status: error.response?.status,
+      details: error.response?.data || error.message
     });
   }
 });
 
 // Health check
 app.get("/", (req, res) => {
-  res.send("Blue Dart EDD server running (static JWT)");
+  res.send("Hard-coded Blue Dart test server running");
 });
 
-// Render dynamic port
-const PORT = process.env.PORT || 3000;
+const PORT = 3000;
 app.listen(PORT, () => {
-  console.log("🚀 Server started on port", PORT);
+  console.log("🚀 Server running on port", PORT);
 });
