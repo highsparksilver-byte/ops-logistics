@@ -60,8 +60,12 @@ app.post("/edd", async (req, res) => {
 
     res.json({ edd });
   } catch (e) {
-    res.status(500).json({ error: "EDD unavailable" });
-  }
-});
+  console.error("EDD ERROR:", e.response?.data || e.message);
+  res.status(500).json({
+    error: "EDD unavailable",
+    details: e.response?.data || e.message
+  });
+}
 
 app.listen(3000, () => console.log("Server running"));
+
