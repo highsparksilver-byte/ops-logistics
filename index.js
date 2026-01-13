@@ -10,18 +10,18 @@ const CLIENT_SECRET = process.env.CLIENT_SECRET;
 const LOGIN_ID = process.env.LOGIN_ID;
 const LICENCE_KEY = process.env.LICENCE_KEY;
 
-// Basic sanity check (shows in Render logs)
+// Sanity check (visible in Render logs)
 if (!CLIENT_ID || !CLIENT_SECRET || !LOGIN_ID || !LICENCE_KEY) {
   console.error("❌ Missing one or more environment variables");
 } else {
   console.log("✅ Environment variables loaded");
 }
 
-// Cache JWT token
+// JWT cache
 let cachedToken = null;
 let tokenExpiry = 0;
 
-// 🔑 Generate JWT Token
+// 🔑 Generate JWT Token (Blue Dart way)
 async function getToken() {
   if (cachedToken && Date.now() < tokenExpiry) {
     return cachedToken;
@@ -45,13 +45,13 @@ async function getToken() {
   }
 
   cachedToken = response.data.JWTToken;
-  tokenExpiry = Date.now() + 23 * 60 * 60 * 1000;
+  tokenExpiry = Date.now() + 23 * 60 * 60 * 1000; // 23 hours
   console.log("✅ JWT token generated");
 
   return cachedToken;
 }
 
-// 📦 EDD API
+// 📦 EDD endpoint
 app.post("/edd", async (req, res) => {
   try {
     console.log("📦 /edd called with:", req.body);
@@ -74,7 +74,7 @@ app.post("/edd", async (req, res) => {
     const response = await axios.post(
       "https://apigateway.bluedart.com/in/transportation/transit-time/v1/GetDomesticTransitTimeForPinCodeandProduct",
       {
-        pPinCodeFrom: "411022",
+        pPinCodeFrom: "411022", // default origin pincode
         pPinCodeTo: pincode,
         pProductCode: "A",
         pSubProductCode: "P",
@@ -88,7 +88,8 @@ app.post("/edd", async (req, res) => {
       },
       {
         headers: {
-          Authorization: `Bearer ${token}`,
+          // 🔴 THIS IS THE CRITICAL FIX
+          JWTToken: token,
           "Content-Type": "application/json",
           Accept: "application/json"
         }
