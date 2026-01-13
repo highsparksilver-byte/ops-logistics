@@ -4,14 +4,18 @@ import axios from "axios";
 const app = express();
 app.use(express.json());
 
-// 🔴 HARD-CODED FOR FINAL TEST ONLY
+// 🔴 HARD-CODE FOR FINAL LEGACY TEST
 const JWT_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzdWJqZWN0LXN1YmplY3QiLCJhdWQiOlsiYXVkaWVuY2UxIiwiYXVkaWVuY2UyIl0sImlzcyI6InVybjovL2FwaWdlZS1lZGdlLUpXVC1wb2xpY3ktdGVzdCIsImV4cCI6MTc2ODQwOTYwNSwiaWF0IjoxNzY4MzIzMjA1LCJqdGkiOiI5MGExZjQ2ZS00NzMzLTQ1OTAtODFjOS04YWUxZGNiYWZhZWMifQ.NIQDd34M0YDSbm5anjaEg0PXfK5Tn32Md9gguGQ5enI";
 const LOGIN_ID = "PNQ90609";
 const LICENCE_KEY = "oupkkkosmeqmuqqfsph8korrp8krmouj";
 
-console.log("🚀 Blue Dart legacy transit test server");
+console.log("🚀 Blue Dart LEGACY Transit API test");
 
-// 🔍 TEST ENDPOINT
+// helper: convert date to legacy format
+function legacyDate() {
+  return `/Date(${Date.now()})/`;
+}
+
 app.post("/edd", async (req, res) => {
   try {
     const response = await axios.post(
@@ -21,10 +25,10 @@ app.post("/edd", async (req, res) => {
         pPinCodeTo: "400099",
         pProductCode: "A",
         pSubProductCode: "P",
-        pPudate: "20260116",
-        pPickupTime: "1600",
+        pPudate: legacyDate(),     // 🔴 legacy date format
+        pPickupTime: "16:00",      // 🔴 legacy time format
         profile: {
-          Api_type: "T",
+          Api_type: "S",           // 🔴 legacy API type
           LicenceKey: LICENCE_KEY,
           LoginID: LOGIN_ID
         }
