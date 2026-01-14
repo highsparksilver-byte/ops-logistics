@@ -6,28 +6,57 @@ app.use(express.json());
 
 /*
 ================================================
- 🔴 MANUAL JWT MODE (STABLE & WORKING)
+ 🧪 CLIENT-ID ONLY JWT EXPERIMENT
 ================================================
 */
 
-// 🔑 Paste FRESH JWT from Blue Dart Portal (valid ~24 hrs)
-const JWT_TOKEN =
-"PASTE_FRESH_JWT_FROM_PORTAL_HERE";
+// 🔑 ClientID ONLY (no clientSecret anywhere)
+const CLIENT_ID = "e8t8RyuHO1rNqZ6GCBsjRoqeokRoCefb";
 
-// 🔐 Read from environment AND TRIM (CRITICAL)
-const LOGIN_ID = process.env.LOGIN_ID?.trim();
-const LICENCE_KEY = process.env.LICENCE_KEY?.trim();
+// 🔑 Hard-coded account credentials (same app)
+const LOGIN_ID = "PNQ90609";
+const LICENCE_KEY = "oupkkkosmeqmuqqfsph8korrp8krmouj";
 
-// Startup sanity logs
-console.log("🚀 Blue Dart EDD server starting");
-console.log("Env check:", {
-  LOGIN_ID: !!LOGIN_ID,
-  LICENCE_KEY: !!LICENCE_KEY,
-  JWT_LENGTH: JWT_TOKEN.length
-});
+// Cache JWT if one is returned
+let cachedJwt = null;
+let jwtFetchedAt = 0;
 
-if (!LOGIN_ID || !LICENCE_KEY) {
-  console.error("❌ LOGIN_ID or LICENCE_KEY missing or empty");
+/*
+================================================
+ Attempt JWT generation with ONLY ClientID
+================================================
+*/
+async function getJwtClientIdOnly() {
+  // reuse token for 1 hour if received
+  if (cachedJwt && Date.now() - jwtFetchedAt < 60 * 60 * 1000) {
+    return cachedJwt;
+  }
+
+  console.log("🔐 Trying JWT generation with ClientID ONLY");
+
+  const res = await axios.get(
+    "https://apigateway.bluedart.com/in/transportation/token/v1/login",
+    {
+      headers: {
+        Accept: "application/json",
+        ClientID: CLIENT_ID
+      },
+      validateStatus: () => true // capture all responses
+    }
+  );
+
+  console.log("🔎 Auth HTTP status:", res.status);
+  console.log("🔎 Auth response body:", res.data);
+
+  if (res.data && res.data.JWTToken) {
+    cachedJwt = res.data.JWTToken;
+    jwtFetchedAt = Date.now();
+    console.log("✅ JWT received via ClientID-only");
+    console.log("JWT length:", cachedJwt.length);
+    return cachedJwt;
+  }
+
+  throw new Error("JWT NOT returned from ClientID-only auth");
 }
 
 /*
@@ -35,65 +64,56 @@ if (!LOGIN_ID || !LICENCE_KEY) {
  Helpers
 ================================================
 */
-
-// Legacy date format REQUIRED by legacy Transit API
 function legacyDateNow() {
   return `/Date(${Date.now()})/`;
 }
 
 /*
 ================================================
- EDD ENDPOINT (PROVEN WORKING)
+ EDD ENDPOINT (uses ClientID-only JWT)
 ================================================
 */
 app.post("/edd", async (req, res) => {
   try {
-    const { pincode } = req.body;
+    const destinationPincode = req.body.pincode || "400099";
 
-    // default if not sent (safe for now)
-    const destinationPincode = pincode || "400099";
+    const jwt = await getJwtClientIdOnly();
 
-    const response = await axios.post(
+    const bdRes = await axios.post(
       "https://apigateway.bluedart.com/in/transportation/transit/v1/GetDomesticTransitTimeForPinCodeandProduct",
       {
-        pPinCodeFrom: "411022",           // origin
-        pPinCodeTo: destinationPincode,  // destination
+        pPinCodeFrom: "411022",
+        pPinCodeTo: destinationPincode,
         pProductCode: "A",
         pSubProductCode: "P",
-        pPudate: legacyDateNow(),         // legacy format
-        pPickupTime: "16:00",             // legacy format
+        pPudate: legacyDateNow(),
+        pPickupTime: "16:00",
         profile: {
-          Api_type: "S",                  // legacy API type
+          Api_type: "S",
           LicenceKey: LICENCE_KEY,
           LoginID: LOGIN_ID
         }
       },
       {
         headers: {
-          JWTToken: JWT_TOKEN,
+          JWTToken: jwt,
           "Content-Type": "application/json",
           Accept: "application/json"
-        }
+        },
+        validateStatus: () => true
       }
     );
 
-    const result =
-      response.data?.GetDomesticTransitTimeForPinCodeandProductResult;
-
     res.json({
-      edd: result?.ExpectedDateDelivery
+      experiment: "client-id-only",
+      transitHttpStatus: bdRes.status,
+      transitResponse: bdRes.data
     });
 
   } catch (error) {
-    console.error("❌ EDD ERROR", {
-      status: error.response?.status,
-      data: error.response?.data,
-      message: error.message
-    });
-
     res.status(500).json({
-      error: "EDD unavailable",
-      details: error.response?.data || error.message
+      experiment: "client-id-only",
+      error: error.message
     });
   }
 });
@@ -103,8 +123,8 @@ app.post("/edd", async (req, res) => {
  Health Check
 ================================================
 */
-app.get("/", (req, res) => {
-  res.send("Blue Dart EDD server running (manual JWT + env trim)");
+app.get("/", (_, res) => {
+  res.send("Blue Dart ClientID-only JWT experiment running");
 });
 
 /*
