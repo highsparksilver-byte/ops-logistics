@@ -5,22 +5,24 @@ const app = express();
 app.use(express.json());
 
 /* =========================
-   HEALTH CHECK (MANDATORY)
+   HEALTH CHECK
 ========================= */
 app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
 /* =========================
-   CONFIG (ENV VARIABLES)
+   CONFIG
 ========================= */
 const CLIENT_ID = process.env.BLUEDART_CLIENT_ID;
 const CLIENT_SECRET = process.env.BLUEDART_CLIENT_SECRET;
 const LOGIN_ID = process.env.BLUEDART_LOGIN_ID;
 const LICENCE_KEY = process.env.BLUEDART_LICENCE_KEY;
 
+const DEFAULT_FROM_PINCODE = "411022";
+
 /* =========================
-   GENERATE JWT TOKEN
+   JWT GENERATION
 ========================= */
 async function generateJWT() {
   const response = await axios.get(
@@ -42,19 +44,22 @@ async function generateJWT() {
 ========================= */
 app.post("/edd", async (req, res) => {
   try {
-    const { from_pincode, to_pincode } = req.body;
+    // ✅ SUPPORT BOTH FORMATS
+    const toPincode =
+      req.body.pincode || req.body.to_pincode || null;
 
-    if (!from_pincode || !to_pincode) {
+    const fromPincode =
+      req.body.from_pincode || DEFAULT_FROM_PINCODE;
+
+    if (!toPincode) {
       return res.status(400).json({ error: "Missing pincode" });
     }
 
-    // 1️⃣ Generate JWT
     const jwtToken = await generateJWT();
 
-    // 2️⃣ Build Blue Dart request
     const payload = {
-      pPinCodeFrom: from_pincode,
-      pPinCodeTo: to_pincode,
+      pPinCodeFrom: fromPincode,
+      pPinCodeTo: toPincode,
       pProductCode: "A",
       pSubProductCode: "P",
       pPudate: `/Date(${Date.now()})/`,
@@ -66,7 +71,6 @@ app.post("/edd", async (req, res) => {
       }
     };
 
-    // 3️⃣ Call Blue Dart Transit API
     const bdResponse = await axios.post(
       "https://apigateway.bluedart.com/in/transportation/transit/v1/GetDomesticTransitTimeForPinCodeandProduct",
       payload,
@@ -85,15 +89,13 @@ app.post("/edd", async (req, res) => {
       return res.status(500).json({ error: "EDD unavailable" });
     }
 
-    // 4️⃣ Return ONLY the EDD (Shopify friendly)
+    // ✅ SAME RESPONSE FORMAT AS BEFORE
     return res.json({
       edd: result.ExpectedDateDelivery
     });
   } catch (err) {
     console.error("EDD ERROR:", err.response?.data || err.message);
-    return res.status(500).json({
-      error: "EDD unavailable"
-    });
+    return res.status(500).json({ error: "EDD unavailable" });
   }
 });
 
@@ -104,4 +106,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
-``
