@@ -6,6 +6,21 @@ app.use(express.json());
 
 /*
 ================================================
+ 🌍 CORS FIX (REQUIRED FOR SHOPIFY)
+================================================
+*/
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, JWTToken");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
+/*
+================================================
  🔐 Environment sanitiser (CRITICAL)
 ================================================
 */
@@ -86,7 +101,7 @@ function legacyDateNow() {
 
 /*
 ================================================
- ✅ HEALTH CHECK (SAFE, NON-BREAKING)
+ HEALTH CHECK
 ================================================
 */
 app.get("/health", (req, res) => {
@@ -95,7 +110,7 @@ app.get("/health", (req, res) => {
 
 /*
 ================================================
- EDD ENDPOINT (UNCHANGED)
+ EDD ENDPOINT (WORKING CONTRACT)
 ================================================
 */
 app.post("/edd", async (req, res) => {
@@ -152,7 +167,7 @@ app.post("/edd", async (req, res) => {
 ================================================
 */
 app.get("/", (_, res) => {
-  res.send("Blue Dart EDD server running (ClientID + Secret JWT)");
+  res.send("Blue Dart EDD server running");
 });
 
 /*
