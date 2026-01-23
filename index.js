@@ -6,16 +6,12 @@ app.use(express.json());
 
 /*
 ================================================
- 🔐 Environment sanitiser (CRITICAL)
+ 🔐 Environment sanitiser
 ================================================
 */
 function cleanEnv(value) {
   if (!value) return value;
-  return value
-    .replace(/\r/g, "")
-    .replace(/\n/g, "")
-    .replace(/\t/g, "")
-    .trim();
+  return value.replace(/\r|\n|\t/g, "").trim();
 }
 
 /*
@@ -36,7 +32,7 @@ console.log("LICENCE_KEY present:", !!LICENCE_KEY);
 
 /*
 ================================================
- 🔑 JWT cache (reuse for 23h)
+ 🔑 JWT cache (23 hours)
 ================================================
 */
 let cachedJwt = null;
@@ -80,25 +76,20 @@ function legacyDateNow() {
 
 /*
 ================================================
- ✅ HEALTH CHECK ENDPOINT
+ ✅ Health check
 ================================================
 */
 app.get("/health", (req, res) => {
   res.status(200).send("OK");
 });
 
-/*
-================================================
- Root endpoint (optional)
-================================================
-*/
 app.get("/", (req, res) => {
   res.send("Blue Dart EDD service running");
 });
 
 /*
 ================================================
- 🚚 EDD ENDPOINT (CORE LOGIC – UNCHANGED)
+ 🚚 EDD ENDPOINT
 ================================================
 */
 app.post("/edd", async (req, res) => {
@@ -157,19 +148,19 @@ app.post("/edd", async (req, res) => {
 
 /*
 ================================================
- 🔁 KEEP RENDER SERVICE WARM
+ 🔁 KEEP RENDER SERVICE WARM (FIXED)
 ================================================
 */
 const SELF_URL = "https://bluedart-edd.onrender.com/health";
 
 setInterval(async () => {
   try {
-    await fetch(SELF_URL);
+    await axios.get(SELF_URL);
     console.log("🔁 Keep-alive ping sent");
   } catch (err) {
     console.error("⚠️ Keep-alive ping failed");
   }
-}, 5 * 60 * 1000); // every 5 minutes
+}, 5 * 60 * 1000);
 
 /*
 ================================================
