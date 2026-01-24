@@ -174,32 +174,13 @@ app.post("/track", async (req, res) => {
       }
     );
 
-    const result =
-      bdRes.data?.ShipmentStatusResult ||
-      bdRes.data?.ShipmentStatusResponse?.Shipment ||
-      bdRes.data?.ShipmentStatusResponse ||
-      bdRes.data?.GetShipmentStatusResult;
-
-    if (!result || result.IsError === true || result.ErrorMessage) {
-      return res.status(404).json({
-        error: "Tracking not available yet"
-      });
-    }
-
-    res.json({
-      status: result.CurrentStatus || "Processing",
-      last_location: result.CurrentLocation || "",
-      last_update: result.StatusDateTime || "",
-      expected_delivery: result.ExpectedDeliveryDate || "",
-      history: (result.Scans || []).map(scan => ({
-        date: scan.ScanDateTime,
-        location: scan.ScanLocation,
-        description: scan.ScanDescription
-      }))
+    // TEMPORARY: return raw response so we see exact structure
+    return res.json({
+      bluedart_raw_response: bdRes.data
     });
 
   } catch (error) {
-    res.status(500).json({
+    return res.status(500).json({
       error: "Tracking unavailable",
       details: error.response?.data || error.message
     });
@@ -235,3 +216,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("Server running on port", PORT);
 });
+
