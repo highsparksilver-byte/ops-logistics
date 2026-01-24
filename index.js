@@ -37,7 +37,8 @@ function cleanEnv(value) {
 const CLIENT_ID = cleanEnv(process.env.CLIENT_ID);
 const CLIENT_SECRET = cleanEnv(process.env.CLIENT_SECRET);
 const LOGIN_ID = cleanEnv(process.env.LOGIN_ID);
-const LICENCE_KEY = cleanEnv(process.env.LICENCE_KEY);
+const LICENCE_KEY_EDD = cleanEnv(process.env.LICENCE_KEY);
+const LICENCE_KEY_TRACKING = cleanEnv(process.env.LICENCE_KEY_TRACKING);
 
 console.log("Blue Dart EDD starting");
 
@@ -161,7 +162,7 @@ app.post("/track", async (req, res) => {
         Request: { AWBNo: awb },
         Profile: {
           Api_type: "S",
-          LicenceKey: LICENCE_KEY,
+          LicenceKey: LICENCE_KEY_TRACKING,
           LoginID: LOGIN_ID
         }
       },
@@ -174,13 +175,32 @@ app.post("/track", async (req, res) => {
       }
     );
 
-    // TEMPORARY: return raw response so we see exact structure
-    return res.json({
-      bluedart_raw_response: bdRes.data
+    const result =
+      bdRes.data?.ShipmentStatusResult ||
+      bdRes.data?.ShipmentStatusResponse?.Shipment ||
+      bdRes.data?.ShipmentStatusResponse ||
+      bdRes.data?.GetShipmentStatusResult;
+
+    if (!result || result.IsError === true || result.ErrorMessage) {
+      return res.status(404).json({
+        error: "Tracking not available yet"
+      });
+    }
+
+    res.json({
+      status: result.CurrentStatus || "Processing",
+      last_location: result.CurrentLocation || "",
+      last_update: result.StatusDateTime || "",
+      expected_delivery: result.ExpectedDeliveryDate || "",
+      history: (result.Scans || []).map(scan => ({
+        date: scan.ScanDateTime,
+        location: scan.ScanLocation,
+        description: scan.ScanDescription
+      }))
     });
 
   } catch (error) {
-    return res.status(500).json({
+    res.status(500).json({
       error: "Tracking unavailable",
       details: error.response?.data || error.message
     });
@@ -216,4 +236,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("Server running on port", PORT);
 });
+
 
