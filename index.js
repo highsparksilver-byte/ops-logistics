@@ -164,7 +164,17 @@ app.post("/edd", async (req, res) => {
 */
 app.post("/track", async (req, res) => {
   try {
-    res.json({ message: "Tracking endpoint alive" });
+    const { awb } = req.body;
+
+if (!awb) {
+  return res.status(400).json({
+    error: "AWB number required"
+  });
+}
+
+res.json({
+  received_awb: awb
+});
   } catch (error) {
     res.status(500).json({ error: "Tracking failed" });
   }
@@ -203,4 +213,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("🚀 Server running on port", PORT);
 });
+
 
