@@ -21,7 +21,7 @@ app.use((req, res, next) => {
 
 /*
 ================================================
- Environment sanitiser (CRITICAL)
+ Environment sanitiser
 ================================================
 */
 function cleanEnv(value) {
@@ -31,16 +31,16 @@ function cleanEnv(value) {
 
 /*
 ================================================
- Credentials from environment
+ Credentials
 ================================================
 */
 const CLIENT_ID = cleanEnv(process.env.CLIENT_ID);
 const CLIENT_SECRET = cleanEnv(process.env.CLIENT_SECRET);
 const LOGIN_ID = cleanEnv(process.env.LOGIN_ID);
-const LICENCE_KEY_EDD = cleanEnv(process.env.LICENCE_KEY);
+const LICENCE_KEY_EDD = cleanEnv(process.env.LICENCE_KEY_EDD);
 const LICENCE_KEY_TRACKING = cleanEnv(process.env.LICENCE_KEY_TRACKING);
 
-console.log("Blue Dart EDD starting");
+console.log("Blue Dart server starting");
 
 /*
 ================================================
@@ -86,7 +86,7 @@ function legacyDateNow() {
 
 /*
 ================================================
- Health check
+ Health
 ================================================
 */
 app.get("/health", (_, res) => {
@@ -95,7 +95,7 @@ app.get("/health", (_, res) => {
 
 /*
 ================================================
- EDD ENDPOINT (WORKING)
+ EDD ENDPOINT (FIXED)
 ================================================
 */
 app.post("/edd", async (req, res) => {
@@ -114,7 +114,7 @@ app.post("/edd", async (req, res) => {
         pPickupTime: "16:00",
         profile: {
           Api_type: "S",
-          LicenceKey: LICENCE_KEY,
+          LicenceKey: LICENCE_KEY_EDD,
           LoginID: LOGIN_ID
         }
       },
@@ -143,7 +143,7 @@ app.post("/edd", async (req, res) => {
 
 /*
 ================================================
- TRACKING ENDPOINT (BLUEDART)
+ TRACKING ENDPOINT (FIXED)
 ================================================
 */
 app.post("/track", async (req, res) => {
@@ -213,7 +213,7 @@ app.post("/track", async (req, res) => {
 ================================================
 */
 app.get("/", (_, res) => {
-  res.send("Blue Dart EDD server running");
+  res.send("Blue Dart server running");
 });
 
 /*
@@ -222,7 +222,6 @@ app.get("/", (_, res) => {
 ================================================
 */
 const SELF_URL = "https://bluedart-edd.onrender.com/health";
-
 setInterval(() => {
   fetch(SELF_URL).catch(() => {});
 }, 5 * 60 * 1000);
@@ -236,5 +235,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("Server running on port", PORT);
 });
-
-
