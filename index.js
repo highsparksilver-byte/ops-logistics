@@ -162,7 +162,7 @@ app.post("/track", async (req, res) => {
         Profile: {
           Api_type: "S",
           LicenceKey: LICENCE_KEY_TRACKING,
-          LoginID: LOGIN_ID_TRACKING
+          LoginID: LOGIN_ID   // ✅ FIX: use existing LOGIN_ID
         }
       },
       {
@@ -183,7 +183,7 @@ app.post("/track", async (req, res) => {
       });
     }
 
-    // Very basic XML extraction (works for most Bluedart responses)
+    // Very basic XML extraction
     const extract = (tag) => {
       const match = xml.match(new RegExp(`<${tag}>(.*?)</${tag}>`));
       return match ? match[1] : "";
@@ -193,8 +193,7 @@ app.post("/track", async (req, res) => {
       status: extract("Status") || extract("CurrentStatus") || "Processing",
       last_location: extract("Location") || extract("CurrentLocation"),
       last_update: extract("StatusDate") || extract("StatusDateTime"),
-      expected_delivery: extract("ExpectedDelivery"),
-      raw: undefined // keep response clean
+      expected_delivery: extract("ExpectedDelivery")
     });
 
   } catch (error) {
@@ -233,4 +232,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("Server running on port", PORT);
 });
+
 
