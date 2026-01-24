@@ -6,7 +6,7 @@ app.use(express.json());
 
 /*
 ================================================
- 🌍 CORS FIX (REQUIRED FOR SHOPIFY)
+ CORS FIX (REQUIRED FOR SHOPIFY)
 ================================================
 */
 app.use((req, res, next) => {
@@ -21,21 +21,17 @@ app.use((req, res, next) => {
 
 /*
 ================================================
- 🔐 Environment sanitiser (CRITICAL)
+ Environment sanitiser (CRITICAL)
 ================================================
 */
 function cleanEnv(value) {
   if (!value) return value;
-  return value
-    .replace(/\r/g, "")
-    .replace(/\n/g, "")
-    .replace(/\t/g, "")
-    .trim();
+  return value.replace(/\r/g, "").replace(/\n/g, "").replace(/\t/g, "").trim();
 }
 
 /*
 ================================================
- 🔑 Credentials from environment
+ Credentials from environment
 ================================================
 */
 const CLIENT_ID = cleanEnv(process.env.CLIENT_ID);
@@ -43,15 +39,11 @@ const CLIENT_SECRET = cleanEnv(process.env.CLIENT_SECRET);
 const LOGIN_ID = cleanEnv(process.env.LOGIN_ID);
 const LICENCE_KEY = cleanEnv(process.env.LICENCE_KEY);
 
-console.log("🚀 Blue Dart EDD starting");
-console.log("CLIENT_ID present:", !!CLIENT_ID);
-console.log("CLIENT_SECRET present:", !!CLIENT_SECRET);
-console.log("LOGIN_ID present:", !!LOGIN_ID);
-console.log("LICENCE_KEY present:", !!LICENCE_KEY);
+console.log("Blue Dart EDD starting");
 
 /*
 ================================================
- 🔑 JWT cache (ClientID + Secret)
+ JWT cache
 ================================================
 */
 let cachedJwt = null;
@@ -61,8 +53,6 @@ async function getJwt() {
   if (cachedJwt && Date.now() - jwtFetchedAt < 23 * 60 * 60 * 1000) {
     return cachedJwt;
   }
-
-  console.log("🔐 Generating new JWT");
 
   const res = await axios.get(
     "https://apigateway.bluedart.com/in/transportation/token/v1/login",
@@ -95,16 +85,16 @@ function legacyDateNow() {
 
 /*
 ================================================
- HEALTH CHECK (USED FOR KEEP-ALIVE)
+ Health check
 ================================================
 */
-app.get("/health", (req, res) => {
+app.get("/health", (_, res) => {
   res.send("OK");
 });
 
 /*
 ================================================
- 🚚 EDD ENDPOINT (UNCHANGED & WORKING)
+ EDD ENDPOINT (WORKING)
 ================================================
 */
 app.post("/edd", async (req, res) => {
@@ -113,8 +103,6 @@ app.post("/edd", async (req, res) => {
     const jwt = await getJwt();
 
     const bdRes = await axios.post(
-     console.log("📦 RAW BLUEDART TRACKING RESPONSE");
-console.log(JSON.stringify(bdRes.data, null, 2));
       "https://apigateway.bluedart.com/in/transportation/transit/v1/GetDomesticTransitTimeForPinCodeandProduct",
       {
         pPinCodeFrom: "411022",
@@ -145,12 +133,6 @@ console.log(JSON.stringify(bdRes.data, null, 2));
     });
 
   } catch (error) {
-    console.error("❌ EDD ERROR", {
-      status: error.response?.status,
-      data: error.response?.data,
-      message: error.message
-    });
-
     res.status(500).json({
       error: "EDD unavailable",
       details: error.response?.data || error.message
@@ -168,21 +150,15 @@ app.post("/track", async (req, res) => {
     const { awb } = req.body;
 
     if (!awb) {
-      return res.status(400).json({
-        error: "AWB number required"
-      });
+      return res.status(400).json({ error: "AWB number required" });
     }
 
-    // Reuse existing JWT logic
     const jwt = await getJwt();
 
-    // Call Bluedart Tracking API
     const bdRes = await axios.post(
       "https://apigateway.bluedart.com/in/transportation/tracking/v1/ShipmentStatus",
       {
-        Request: {
-          AWBNo: awb
-        },
+        Request: { AWBNo: awb },
         Profile: {
           Api_type: "S",
           LicenceKey: LICENCE_KEY,
@@ -198,7 +174,6 @@ app.post("/track", async (req, res) => {
       }
     );
 
-    // Bluedart returns different keys depending on environment
     const result =
       bdRes.data?.ShipmentStatusResult ||
       bdRes.data?.ShipmentStatusResponse?.Shipment ||
@@ -224,12 +199,6 @@ app.post("/track", async (req, res) => {
     });
 
   } catch (error) {
-    console.error("TRACKING ERROR", {
-      status: error.response?.status,
-      data: error.response?.data,
-      message: error.message
-    });
-
     res.status(500).json({
       error: "Tracking unavailable",
       details: error.response?.data || error.message
@@ -238,7 +207,6 @@ app.post("/track", async (req, res) => {
 });
 
 /*
-
 ================================================
  Root
 ================================================
@@ -248,32 +216,22 @@ app.get("/", (_, res) => {
 });
 
 /*
-
 ================================================
- 🔁 KEEP RENDER WARM (SAFE, NO SIDE EFFECTS)
+ Keep Render warm
 ================================================
 */
 const SELF_URL = "https://bluedart-edd.onrender.com/health";
 
 setInterval(() => {
-  fetch(SELF_URL)
-    .then(() => console.log("🔁 Keep-alive ping sent"))
-    .catch(() => console.log("⚠️ Keep-alive ping failed"));
-}, 5 * 60 * 1000); // every 5 minutes
+  fetch(SELF_URL).catch(() => {});
+}, 5 * 60 * 1000);
 
 /*
 ================================================
- 🚀 Start server
+ Start server
 ================================================
 */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log("🚀 Server running on port", PORT);
+  console.log("Server running on port", PORT);
 });
-
-
-
-
-
-
-
