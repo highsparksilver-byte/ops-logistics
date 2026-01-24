@@ -1,5 +1,6 @@
 import express from "express";
 import axios from "axios";
+import xml2js from "xml2js";
 
 const app = express();
 app.use(express.json());
@@ -43,7 +44,7 @@ const CLIENT_SECRET = cleanEnv(process.env.CLIENT_SECRET);
 const LOGIN_ID = cleanEnv(process.env.LOGIN_ID);
 const LICENCE_KEY = cleanEnv(process.env.LICENCE_KEY);
 
-console.log("🚀 Blue Dart EDD starting");
+console.log("🚀 Blue Dart Server starting");
 console.log("CLIENT_ID present:", !!CLIENT_ID);
 console.log("CLIENT_SECRET present:", !!CLIENT_SECRET);
 console.log("LOGIN_ID present:", !!LOGIN_ID);
@@ -61,8 +62,6 @@ async function getJwt() {
   if (cachedJwt && Date.now() - jwtFetchedAt < 23 * 60 * 60 * 1000) {
     return cachedJwt;
   }
-
-  console.log("🔐 Generating new JWT");
 
   const res = await axios.get(
     "https://apigateway.bluedart.com/in/transportation/token/v1/login",
@@ -93,18 +92,31 @@ function legacyDateNow() {
   return `/Date(${Date.now()})/`;
 }
 
+function parseXml(xml) {
+  return new Promise((resolve, reject) => {
+    xml2js.parseString(
+      xml,
+      { explicitArray: false, ignoreAttrs: false },
+      (err, result) => {
+        if (err) reject(err);
+        else resolve(result);
+      }
+    );
+  });
+}
+
 /*
 ================================================
- HEALTH CHECK (USED FOR KEEP-ALIVE)
+ HEALTH CHECK
 ================================================
 */
-app.get("/health", (req, res) => {
+app.get("/health", (_, res) => {
   res.send("OK");
 });
 
 /*
 ================================================
- 🚚 EDD ENDPOINT (UNCHANGED & WORKING)
+ 🚚 EDD ENDPOINT (UNCHANGED)
 ================================================
 */
 app.post("/edd", async (req, res) => {
@@ -143,16 +155,67 @@ app.post("/edd", async (req, res) => {
     });
 
   } catch (error) {
-    console.error("❌ EDD ERROR", {
-      status: error.response?.status,
-      data: error.response?.data,
-      message: error.message
+    console.error("❌ EDD ERROR", error.message);
+    res.status(500).json({ error: "EDD unavailable" });
+  }
+});
+
+/*
+================================================
+ 📦 LEGACY TRACKING (SECURE)
+================================================
+*/
+app.post("/tracking", async (req, res) => {
+  try {
+    const { awb, scans = 0 } = req.body;
+
+    if (!awb) {
+      return res.status(400).json({ error: "AWB required" });
+    }
+
+    const url =
+      "https://api.bluedart.com/servlet/RoutingServlet" +
+      "?handler=tnt" +
+      "&action=custawbquery" +
+      "&loginid=" + LOGIN_ID +
+      "&awb=awb" +
+      "&numbers=" + awb +
+      "&format=xml" +
+      "&lickey=" + LICENCE_KEY +
+      "&verno=1" +
+      "&scan=" + (scans ? 1 : 0);
+
+    const bdRes = await axios.get(url, {
+      timeout: 15000,
+      responseType: "text"
     });
 
-    res.status(500).json({
-      error: "EDD unavailable",
-      details: error.response?.data || error.message
+    const parsed = await parseXml(bdRes.data);
+    const shipment = parsed?.ShipmentData?.Shipment;
+
+    if (!shipment) {
+      return res.json({ status: "NO_DATA" });
+    }
+
+    res.json({
+      awb: shipment.$?.WaybillNo || awb,
+      status: shipment.Status || null,
+      statusType: shipment.StatusType || null,
+      expectedDelivery: shipment.ExpectedDeliveryDate || null,
+      statusDate: shipment.StatusDate || null,
+      statusTime: shipment.StatusTime || null,
+      receivedBy: shipment.ReceivedBy || null,
+      instructions: shipment.Instructions || null,
+      scans: shipment.Scans?.ScanDetail
+        ? Array.isArray(shipment.Scans.ScanDetail)
+          ? shipment.Scans.ScanDetail
+          : [shipment.Scans.ScanDetail]
+        : []
     });
+
+  } catch (err) {
+    console.error("❌ TRACKING ERROR", err.message);
+    res.status(500).json({ error: "Tracking unavailable" });
   }
 });
 
@@ -162,21 +225,19 @@ app.post("/edd", async (req, res) => {
 ================================================
 */
 app.get("/", (_, res) => {
-  res.send("Blue Dart EDD server running");
+  res.send("Blue Dart EDD + Tracking server running");
 });
 
 /*
 ================================================
- 🔁 KEEP RENDER WARM (SAFE, NO SIDE EFFECTS)
+ 🔁 KEEP RENDER WARM
 ================================================
 */
 const SELF_URL = "https://bluedart-edd.onrender.com/health";
 
 setInterval(() => {
-  fetch(SELF_URL)
-    .then(() => console.log("🔁 Keep-alive ping sent"))
-    .catch(() => console.log("⚠️ Keep-alive ping failed"));
-}, 5 * 60 * 1000); // every 5 minutes
+  fetch(SELF_URL).catch(() => {});
+}, 5 * 60 * 1000);
 
 /*
 ================================================
