@@ -149,7 +149,6 @@ app.post("/edd", async (req, res) => {
 app.post("/track", async (req, res) => {
   try {
     const { awb } = req.body;
-
     if (!awb) {
       return res.status(400).json({ error: "AWB number required" });
     }
@@ -163,40 +162,39 @@ app.post("/track", async (req, res) => {
         Profile: {
           Api_type: "S",
           LicenceKey: LICENCE_KEY_TRACKING,
-          LoginID: LOGIN_ID
+          LoginID: LOGIN_ID_TRACKING
         }
       },
       {
         headers: {
           JWTToken: jwt,
-          "Content-Type": "application/json",
-          Accept: "application/json"
-        }
+          "Content-Type": "application/json"
+        },
+        responseType: "text" // force raw XML
       }
     );
 
-    const result =
-      bdRes.data?.ShipmentStatusResult ||
-      bdRes.data?.ShipmentStatusResponse?.Shipment ||
-      bdRes.data?.ShipmentStatusResponse ||
-      bdRes.data?.GetShipmentStatusResult;
+    const xml = bdRes.data;
 
-    if (!result || result.IsError === true || result.ErrorMessage) {
+    // If Bluedart returned an error in XML
+    if (xml.includes("<Error>")) {
       return res.status(404).json({
         error: "Tracking not available yet"
       });
     }
 
+    // Very basic XML extraction (works for most Bluedart responses)
+    const extract = (tag) => {
+      const match = xml.match(new RegExp(`<${tag}>(.*?)</${tag}>`));
+      return match ? match[1] : "";
+    };
+
     res.json({
-      status: result.CurrentStatus || "Processing",
-      last_location: result.CurrentLocation || "",
-      last_update: result.StatusDateTime || "",
-      expected_delivery: result.ExpectedDeliveryDate || "",
-      history: (result.Scans || []).map(scan => ({
-        date: scan.ScanDateTime,
-        location: scan.ScanLocation,
-        description: scan.ScanDescription
-      }))
+      status: extract("Status") || extract("CurrentStatus") || "Processing",
+      last_location: extract("Location") || extract("CurrentLocation"),
+      last_update: extract("StatusDate") || extract("StatusDateTime"),
+      expected_delivery: extract("ExpectedDelivery"),
+      raw: undefined // keep response clean
     });
 
   } catch (error) {
@@ -235,3 +233,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("Server running on port", PORT);
 });
+
