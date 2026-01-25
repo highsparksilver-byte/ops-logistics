@@ -51,7 +51,7 @@ console.log("TRACKING_LICENCE_KEY present:", !!TRACKING_LICENCE_KEY);
 
 /*
 ================================================
- 🔑 JWT cache (for EDD only)
+ 🔑 JWT cache (EDD only)
 ================================================
 */
 let cachedJwt = null;
@@ -115,7 +115,7 @@ app.get("/health", (_, res) => {
 
 /*
 ================================================
- 🚚 EDD (UNCHANGED & WORKING)
+ 🚚 EDD (UNCHANGED)
 ================================================
 */
 app.post("/edd", async (req, res) => {
@@ -161,7 +161,7 @@ app.post("/edd", async (req, res) => {
 
 /*
 ================================================
- 📦 LEGACY TRACKING (SECURE)
+ 📦 LEGACY TRACKING (POST – INTERNAL)
 ================================================
 */
 app.post("/tracking", async (req, res) => {
@@ -211,6 +211,29 @@ app.post("/tracking", async (req, res) => {
 
   } catch (err) {
     console.error("❌ TRACKING ERROR:", err.message);
+    res.status(500).json({ error: "Tracking unavailable" });
+  }
+});
+
+/*
+================================================
+ 🌐 PUBLIC TRACKING URL (GET – FOR WEBSITE)
+================================================
+*/
+app.get("/track", async (req, res) => {
+  const { awb } = req.query;
+  if (!awb) return res.status(400).json({ error: "AWB required" });
+
+  try {
+    const response = await axios.post(
+      "https://bluedart-edd.onrender.com/tracking",
+      { awb, scans: 1 },
+      { headers: { "Content-Type": "application/json" } }
+    );
+
+    res.json(response.data);
+
+  } catch (err) {
     res.status(500).json({ error: "Tracking unavailable" });
   }
 });
