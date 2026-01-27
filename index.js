@@ -100,12 +100,30 @@ function calculatePickupDate() {
   return `/Date(${pickupDate.getTime()})/`;
 }
 
+// ✅ FIXED: Robust Parser (Case-Insensitive + Crash Proof)
 function parseBlueDartDate(dateStr) {
-  if (!dateStr) return null;
-  const months = { Jan:0, Feb:1, Mar:2, Apr:3, May:4, Jun:5, Jul:6, Aug:7, Sep:8, Oct:9, Nov:10, Dec:11 };
+  if (!dateStr || typeof dateStr !== "string") return null;
+  
+  const months = { jan:0, feb:1, mar:2, apr:3, may:4, jun:5, jul:6, aug:7, sep:8, oct:9, nov:10, dec:11 };
   const parts = dateStr.split("-");
+  
   if (parts.length !== 3) return null;
-  return new Date(Date.UTC(parts[2], months[parts[1]], parts[0]));
+  
+  const day = parseInt(parts[0], 10);
+  const monthStr = parts[1].toLowerCase();
+  const year = parseInt(parts[2], 10);
+
+  // Validate components
+  if (isNaN(day) || months[monthStr] === undefined || isNaN(year)) return null;
+
+  // Create Date (Assume 20xx if year is 2 digits)
+  const fullYear = year < 100 ? 2000 + year : year;
+  const d = new Date(Date.UTC(fullYear, months[monthStr], day));
+
+  // ⚠️ CRITICAL CHECK: Ensure it is a valid date
+  if (isNaN(d.getTime())) return null;
+
+  return d;
 }
 
 function calculateConfidenceBand(eddStr) {
@@ -116,6 +134,7 @@ function calculateConfidenceBand(eddStr) {
   maxDate.setUTCDate(maxDate.getUTCDate() + 1);
 
   const isBadDayUTC = (d) => {
+     if (isNaN(d.getTime())) return false; // Safety check
      const day = d.getUTCDay();
      const ymd = d.toISOString().slice(0, 10);
      return day === 0 || HOLIDAYS.includes(ymd);
@@ -274,7 +293,7 @@ app.post("/edd", async (req, res) => {
 });
 
 /* =================================================
-   📦 TRACKING LOGIC (UPDATED & FIXED)
+   📦 TRACKING LOGIC
 ================================================= */
 async function trackBluedart(awb) {
   try {
@@ -310,15 +329,12 @@ async function trackShiprocket(awb) {
     const t = res.data.tracking_data;
     if (!t) return null;
 
-    // ✅ FIX: Shiprocket output often puts details in 'shipment_track' array
     const mainTrack = t.shipment_track && t.shipment_track[0] ? t.shipment_track[0] : {};
 
-    // 1. Fallback Logic for Fields
     const rawStatus = t.current_status || mainTrack.current_status || "";
     const courier = t.courier_name || mainTrack.courier_name || "Shiprocket";
     const edd = t.estimated_delivery_date || mainTrack.edd || null;
     
-    // 2. Determine Date (Delivered Date OR Status Date)
     const statusDate = rawStatus.toUpperCase() === "DELIVERED" 
       ? (mainTrack.delivered_date || t.shipment_track_activities?.[0]?.date) 
       : (t.shipment_track_activities?.[0]?.date || mainTrack.pickup_date);
