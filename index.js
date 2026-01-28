@@ -60,6 +60,8 @@ async function trackBluedart(awb) {
       timeout: 8000,
     });
 
+console.log("📄 RAW BD XML:", res.data);
+
     const parsed = await new Promise((resolve, reject) =>
       xml2js.parseString(
         res.data,
