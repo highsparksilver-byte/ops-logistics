@@ -1,6 +1,14 @@
 import express from "express";
 import axios from "axios";
 import xml2js from "xml2js";
+import pg from "pg";
+const { Pool } = pg;
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
 
 const app = express();
 app.use(express.json());
@@ -360,6 +368,26 @@ app.get("/track", async (req, res) => {
   if (data) return res.json(data);
   res.status(404).json({ error: "Tracking details not found" });
 });
+/* =================================================
+   ⏱️ CRON SYNC (PRIVATE)
+================================================= */
+app.post("/_cron/sync", async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT COUNT(*) AS due
+      FROM shipments
+      WHERE delivery_confirmed = false
+      AND next_check_at <= NOW()
+    `);
+
+    console.log("🕒 Cron sync triggered. Due shipments:", rows[0].due);
+
+    res.json({ ok: true, due: Number(rows[0].due) });
+  } catch (err) {
+    console.error("❌ Cron sync failed:", err.message);
+    res.status(500).json({ ok: false });
+  }
+});
 
 /* =================================================
    ❤️ HEALTH
@@ -370,3 +398,4 @@ if (SELF_URL) setInterval(() => { axios.get(SELF_URL).catch(() => {}); }, 10 * 6
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("🚀 Server running on port", PORT));
+
