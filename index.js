@@ -20,7 +20,7 @@ const app = express();
 app.use(express.json());
 
 /* =================================================
-   🌍 CORS
+   🌍 CORS (SAFE)
 ================================================= */
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -30,51 +30,31 @@ app.use((req, res, next) => {
   next();
 });
 
-/* =================================================
-   🔑 CONFIG
-================================================= */
-const CLIENT_ID = process.env.CLIENT_ID;
-const CLIENT_SECRET = process.env.CLIENT_SECRET;
-const LOGIN_ID = process.env.LOGIN_ID;
-const LICENCE_KEY_TRACK = process.env.BD_LICENCE_KEY_TRACK;
-
-console.log("🚀 Server Starting...");
-console.log("📍 Warehouse: Pune (411022)");
+const clean = (v) => v?.replace(/\r|\n|\t/g, "").trim();
 
 /* =================================================
-   🔑 JWT CACHE (BLUEDART)
+   🔑 ENV VARS
 ================================================= */
-let bdJwt = null;
-let bdJwtAt = 0;
+const LOGIN_ID = clean(process.env.LOGIN_ID);
+const LICENCE_KEY_TRACK = clean(process.env.BD_LICENCE_KEY_TRACK);
 
-async function getBluedartJwt() {
-  if (bdJwt && Date.now() - bdJwtAt < 23 * 60 * 60 * 1000) return bdJwt;
-
-  const res = await axios.get(
-    "https://apigateway.bluedart.com/in/transportation/token/v1/login",
-    {
-      headers: {
-        Accept: "application/json",
-        ClientID: CLIENT_ID,
-        clientSecret: CLIENT_SECRET,
-      },
-    }
-  );
-
-  bdJwt = res.data.JWTToken;
-  bdJwtAt = Date.now();
-  return bdJwt;
-}
+console.log("🚀 Ops Logistics – Phase 4 Booting...");
+console.log("📍 Courier: Blue Dart");
 
 /* =================================================
-   📦 TRACKING (BLUEDART)
+   📦 BLUE DART – BATCH TRACKING (25 AWBs / CALL)
 ================================================= */
-async function trackBluedart(awb) {
+async function trackBluedartBatch(awbs) {
+  if (!awbs.length) return {};
+
+  const awbString = awbs.join(",");
+
   try {
     const url =
       "https://api.bluedart.com/servlet/RoutingServlet" +
       `?handler=tnt&action=custawbquery&loginid=${LOGIN_ID}` +
-      `&awb=awb&numbers=${awb}&format=xml&lickey=${LICENCE_KEY_TRACK}&verno=1&scan=1`;
+      `&awb=awb&numbers=${awbString}` +
+      `&format=xml&lickey=${LICENCE_KEY_TRACK}&verno=1&scan=1`;
 
     const res = await axios.get(url, {
       responseType: "text",
@@ -87,48 +67,37 @@ async function trackBluedart(awb) {
       )
     );
 
-    const s = parsed?.ShipmentData?.Shipment;
-    if (!s || !s.Status) return null;
+    const shipments = parsed?.ShipmentData?.Shipment;
+    if (!shipments) return {};
 
-    return {
-      status: s.Status,
-      statusType: s.StatusType, // DL, UD, RT, etc
-    };
-  } catch {
-    return null;
+    const list = Array.isArray(shipments) ? shipments : [shipments];
+    const map = {};
+
+    for (const s of list) {
+      map[s.$.WaybillNo] = {
+        status: s.Status,
+        statusType: s.StatusType, // DL / UD / RT / IT
+      };
+    }
+
+    return map;
+  } catch (err) {
+    console.error("❌ Blue Dart batch failed:", err.message);
+    return {};
   }
 }
 
 /* =================================================
-   ⏱️ NEXT CHECK CALCULATOR (TRAFFIC LIGHT)
-================================================= */
-function calculateNextCheck(statusType) {
-  const now = new Date();
-
-  // 🔴 STOP FOREVER
-  if (statusType === "DL" || statusType === "RT") {
-    return new Date("9999-01-01");
-  }
-
-  // 🟢 FAST
-  if (statusType === "UD") {
-    return new Date(now.getTime() + 1 * 60 * 60 * 1000); // 1 hour
-  }
-
-  // 🟡 SLOW
-  return new Date(now.getTime() + 12 * 60 * 60 * 1000); // 12 hours
-}
-
-/* =================================================
-   ❤️ HEALTH
+   ❤️ HEALTH CHECK
 ================================================= */
 app.get("/health", (_, res) => res.send("OK"));
 
 /* =================================================
-   ⏱️ CRON SYNC (PRIVATE)
+   ⏱️ CRON SYNC — PHASE 4 CORE
 ================================================= */
 app.post("/_cron/sync", async (req, res) => {
   try {
+    // 1️⃣ Pull ONLY what needs checking (DB-driven)
     const { rows } = await pool.query(`
       SELECT id, awb
       FROM shipments
@@ -139,48 +108,74 @@ app.post("/_cron/sync", async (req, res) => {
       LIMIT 25
     `);
 
-    console.log("🕒 Cron run | Due:", rows.length);
-
-    for (const row of rows) {
-      const tracking = { status: "Delivered", statusType: "DL" };
-      if (!tracking) continue;
-
-      const nextCheck = calculateNextCheck(tracking.statusType);
-
-      await pool.query(
-        `
-        UPDATE shipments
-        SET
-          last_known_status = $1,
-          last_checked_at = NOW(),
-          next_check_at = $2,
-          delivery_confirmed = $3,
-          delivered_at = CASE WHEN $3 = true THEN NOW() ELSE delivered_at END
-        WHERE id = $4
-        `,
-        [
-          tracking.status,
-          nextCheck,
-          tracking.statusType === "DL",
-          row.id,
-        ]
-      );
-
-      console.log(
-        `📦 ${row.awb} → ${tracking.statusType} | next check @ ${nextCheck.toISOString()}`
-      );
+    if (!rows.length) {
+      return res.json({ ok: true, processed: 0 });
     }
 
-    res.json({ ok: true, processed: rows.length });
+    const awbs = rows.map(r => r.awb);
+
+    // 2️⃣ ONE API CALL FOR 25 ORDERS
+    const tracking = await trackBluedartBatch(awbs);
+
+    let processed = 0;
+
+    // 3️⃣ Update DB + Reschedule
+    for (const row of rows) {
+      const t = tracking[row.awb];
+      if (!t) continue;
+
+      // 🔴 STOP — Delivered / RTO
+      if (t.statusType === "DL" || t.statusType === "RT") {
+        await pool.query(`
+          UPDATE shipments
+          SET
+            last_known_status = $1,
+            delivery_confirmed = true,
+            delivered_at = NOW(),
+            last_checked_at = NOW(),
+            next_check_at = '9999-01-01'
+          WHERE id = $2
+        `, [t.status, row.id]);
+      }
+
+      // 🟢 FAST — Out for Delivery / Undelivered
+      else if (t.statusType === "UD") {
+        await pool.query(`
+          UPDATE shipments
+          SET
+            last_known_status = $1,
+            last_checked_at = NOW(),
+            next_check_at = NOW() + INTERVAL '1 hour'
+          WHERE id = $2
+        `, [t.status, row.id]);
+      }
+
+      // 🟡 SLOW — In Transit
+      else {
+        await pool.query(`
+          UPDATE shipments
+          SET
+            last_known_status = $1,
+            last_checked_at = NOW(),
+            next_check_at = NOW() + INTERVAL '12 hours'
+          WHERE id = $2
+        `, [t.status, row.id]);
+      }
+
+      processed++;
+    }
+
+    console.log(`🕒 Cron run | Processed: ${processed}`);
+
+    res.json({ ok: true, processed });
   } catch (err) {
-    console.error("❌ Cron sync failed");
-    console.error(err);
+    console.error("❌ Cron crash:", err.message);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
 /* =================================================
-   🧠 KEEP-ALIVE (RENDER)
+   🔁 RENDER KEEP-ALIVE (FREE TIER SAFE)
 ================================================= */
 const SELF_URL = process.env.RENDER_EXTERNAL_URL
   ? `${process.env.RENDER_EXTERNAL_URL}/health`
@@ -196,6 +191,6 @@ if (SELF_URL) {
    🚀 START SERVER
 ================================================= */
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("🚀 Server running on port", PORT);
-});
+app.listen(PORT, () =>
+  console.log("🚀 Ops Logistics running on port", PORT)
+);
