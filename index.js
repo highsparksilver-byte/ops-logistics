@@ -36,43 +36,7 @@ app.use((req, res, next) => {
 const LOGIN_ID = process.env.LOGIN_ID;
 const LICENCE_KEY_TRACK = process.env.BD_LICENCE_KEY_TRACK;
 
-console.log("🚀 Ops Logistics starting…");
-
-/* =================================================
-   📦 BLUEDART TRACKING
-================================================= */
-async function trackBluedart(awb) {
-  try {
-    const url =
-      "https://api.bluedart.com/servlet/RoutingServlet" +
-      `?handler=tnt&action=custawbquery&loginid=${LOGIN_ID}` +
-      `&awb=awb&numbers=${awb}&format=xml&lickey=${LICENCE_KEY_TRACK}&verno=1&scan=1`;
-
-    console.log(`📡 Calling Blue Dart for ${awb}`);
-
-    const res = await axios.get(url, { responseType: "text", timeout: 10000 });
-
-    console.log(`📄 RAW BD XML for ${awb}:\n${res.data}`);
-
-    const parsed = await new Promise((resolve, reject) =>
-      xml2js.parseString(res.data, { explicitArray: false }, (err, r) =>
-        err ? reject(err) : resolve(r)
-      )
-    );
-
-    const shipment = parsed?.ShipmentData?.Shipment;
-    if (!shipment || !shipment.StatusType) return null;
-
-    return {
-      status: shipment.Status,
-      statusType: shipment.StatusType,
-    };
-  } catch (err) {
-    console.error(`❌ Blue Dart API failed for ${awb}`);
-    console.error(err.message);
-    return null;
-  }
-}
+console.log("🚀 Ops Logistics starting (Phase 5.2 – Batched)");
 
 /* =================================================
    🧠 TRAFFIC LIGHT SCHEDULER
@@ -85,14 +49,58 @@ function calculateNextCheck(statusType) {
   }
 
   if (statusType === "UD") {
-    return new Date(now.getTime() + 1 * 60 * 60 * 1000); // 1 hour
+    return new Date(now.getTime() + 1 * 60 * 60 * 1000);
   }
 
   if (statusType === "IT" || statusType === "PU") {
-    return new Date(now.getTime() + 12 * 60 * 60 * 1000); // 12 hours
+    return new Date(now.getTime() + 12 * 60 * 60 * 1000);
   }
 
-  return new Date(now.getTime() + 24 * 60 * 60 * 1000); // fallback
+  return new Date(now.getTime() + 24 * 60 * 60 * 1000);
+}
+
+/* =================================================
+   📦 BLUEDART — BATCH TRACKING
+================================================= */
+async function trackBluedartBatch(awbs) {
+  if (!awbs.length) return {};
+
+  const awbString = awbs.join(",");
+
+  const url =
+    "https://api.bluedart.com/servlet/RoutingServlet" +
+    `?handler=tnt&action=custawbquery&loginid=${LOGIN_ID}` +
+    `&awb=awb&numbers=${awbString}&format=xml&lickey=${LICENCE_KEY_TRACK}&verno=1&scan=1`;
+
+  console.log(`📡 Blue Dart batch call (${awbs.length} AWBs)`);
+
+  const res = await axios.get(url, {
+    responseType: "text",
+    timeout: 15000,
+  });
+
+  console.log(`📄 RAW BD XML (batch)`);
+
+  const parsed = await new Promise((resolve, reject) =>
+    xml2js.parseString(res.data, { explicitArray: false }, (err, r) =>
+      err ? reject(err) : resolve(r)
+    )
+  );
+
+  const shipments = parsed?.ShipmentData?.Shipment;
+  if (!shipments) return {};
+
+  const list = Array.isArray(shipments) ? shipments : [shipments];
+
+  const result = {};
+  for (const s of list) {
+    result[s.$.WaybillNo] = {
+      status: s.Status,
+      statusType: s.StatusType,
+    };
+  }
+
+  return result;
 }
 
 /* =================================================
@@ -101,10 +109,10 @@ function calculateNextCheck(statusType) {
 app.get("/health", (_, res) => res.send("OK"));
 
 /* =================================================
-   ⏱️ CRON SYNC
+   ⏱️ CRON SYNC (BATCHED)
 ================================================= */
 app.post("/_cron/sync", async (_, res) => {
-  console.log("🕒 Cron sync started");
+  console.log("🕒 Cron sync started (batched)");
 
   try {
     const { rows } = await pool.query(`
@@ -117,25 +125,28 @@ app.post("/_cron/sync", async (_, res) => {
       LIMIT 25
     `);
 
-    console.log(`📦 DB rows fetched: ${rows.length}`);
+    console.log(`📦 Due shipments: ${rows.length}`);
+
+    if (!rows.length) {
+      return res.json({ ok: true, processed: 0 });
+    }
+
+    const awbs = rows.map(r => r.awb);
+    const trackingMap = await trackBluedartBatch(awbs);
 
     let processed = 0;
 
     for (const row of rows) {
-      const { id, awb } = row;
-      console.log(`➡️ Processing AWB: ${awb}`);
-
-      const tracking = await trackBluedart(awb);
+      const tracking = trackingMap[row.awb];
       if (!tracking) {
-        console.log(`⏭️ Skipping AWB (no tracking): ${awb}`);
+        console.log(`⏭️ No tracking for ${row.awb}`);
         continue;
       }
 
       const { status, statusType } = tracking;
       const nextCheck = calculateNextCheck(statusType);
 
-      console.log(`✅ Status for ${awb}: ${statusType}`);
-      console.log(`⏭️ Next check at: ${nextCheck.toISOString()}`);
+      console.log(`✅ ${row.awb} → ${statusType}`);
 
       await pool.query(
         `
@@ -153,18 +164,17 @@ app.post("/_cron/sync", async (_, res) => {
           status,
           statusType === "DL" || statusType === "RT",
           nextCheck,
-          id,
+          row.id,
         ]
       );
 
       processed++;
     }
 
-    console.log(`🏁 Cron sync finished | Processed: ${processed}`);
-
+    console.log(`🏁 Cron finished | Processed: ${processed}`);
     res.json({ ok: true, processed });
   } catch (err) {
-    console.error("🔥 Cron sync crashed");
+    console.error("🔥 Cron failed");
     console.error(err);
     res.status(500).json({ ok: false, error: err.message });
   }
