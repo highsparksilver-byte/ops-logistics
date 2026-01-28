@@ -142,7 +142,7 @@ app.post("/_cron/sync", async (req, res) => {
     console.log("🕒 Cron run | Due:", rows.length);
 
     for (const row of rows) {
-      const tracking = await trackBluedart(row.awb);
+      const tracking = { status: "Delivered", statusType: "DL" };
       if (!tracking) continue;
 
       const nextCheck = calculateNextCheck(tracking.statusType);
