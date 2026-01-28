@@ -20,7 +20,7 @@ const app = express();
 app.use(express.json());
 
 /* =================================================
-   🌍 CORS (SAFE)
+   🌍 CORS (SHOPIFY SAFE)
 ================================================= */
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -30,31 +30,30 @@ app.use((req, res, next) => {
   next();
 });
 
+/* =================================================
+   🔑 ENV HELPERS
+================================================= */
 const clean = (v) => v?.replace(/\r|\n|\t/g, "").trim();
 
-/* =================================================
-   🔑 ENV VARS
-================================================= */
 const LOGIN_ID = clean(process.env.LOGIN_ID);
 const LICENCE_KEY_TRACK = clean(process.env.BD_LICENCE_KEY_TRACK);
 
-console.log("🚀 Ops Logistics – Phase 4 Booting...");
-console.log("📍 Courier: Blue Dart");
+/* =================================================
+   🩺 HEALTH
+================================================= */
+app.get("/health", (_, res) => res.send("OK"));
 
 /* =================================================
-   📦 BLUE DART – BATCH TRACKING (25 AWBs / CALL)
+   📦 BLUE DART TRACKING
 ================================================= */
-async function trackBluedartBatch(awbs) {
-  if (!awbs.length) return {};
-
-  const awbString = awbs.join(",");
-
+async function trackBluedart(awb) {
   try {
     const url =
       "https://api.bluedart.com/servlet/RoutingServlet" +
       `?handler=tnt&action=custawbquery&loginid=${LOGIN_ID}` +
-      `&awb=awb&numbers=${awbString}` +
-      `&format=xml&lickey=${LICENCE_KEY_TRACK}&verno=1&scan=1`;
+      `&awb=awb&numbers=${awb}&format=xml&lickey=${LICENCE_KEY_TRACK}&verno=1&scan=1`;
+
+    console.log("📡 Calling Blue Dart for", awb);
 
     const res = await axios.get(url, {
       responseType: "text",
@@ -62,44 +61,43 @@ async function trackBluedartBatch(awbs) {
     });
 
     const parsed = await new Promise((resolve, reject) =>
-      xml2js.parseString(res.data, { explicitArray: false }, (err, r) =>
-        err ? reject(err) : resolve(r)
+      xml2js.parseString(
+        res.data,
+        { explicitArray: false },
+        (err, result) => (err ? reject(err) : resolve(result))
       )
     );
 
-    const shipments = parsed?.ShipmentData?.Shipment;
-    if (!shipments) return {};
-
-    const list = Array.isArray(shipments) ? shipments : [shipments];
-    const map = {};
-
-    for (const s of list) {
-      map[s.$.WaybillNo] = {
-        status: s.Status,
-        statusType: s.StatusType, // DL / UD / RT / IT
-      };
+    const s = parsed?.ShipmentData?.Shipment;
+    if (!s || !s.StatusType) {
+      console.log("⚠️ Blue Dart response invalid for", awb);
+      return null;
     }
 
-    return map;
+    console.log("✅ Blue Dart status for", awb, "→", s.StatusType);
+
+    return {
+      status: s.Status,
+      statusType: s.StatusType,
+    };
   } catch (err) {
-    console.error("❌ Blue Dart batch failed:", err.message);
-    return {};
+    console.log("❌ Blue Dart API failed for", awb);
+    console.log(err.message);
+    return null;
   }
 }
 
 /* =================================================
-   ❤️ HEALTH CHECK
-================================================= */
-app.get("/health", (_, res) => res.send("OK"));
-
-/* =================================================
-   ⏱️ CRON SYNC — PHASE 4 CORE
+   ⏱️ CRON SYNC (PRIVATE)
 ================================================= */
 app.post("/_cron/sync", async (req, res) => {
+  let processed = 0;
+
   try {
-    // 1️⃣ Pull ONLY what needs checking (DB-driven)
+    console.log("🕒 Cron sync started");
+
     const { rows } = await pool.query(`
-      SELECT id, awb
+      SELECT id, awb, last_known_status
       FROM shipments
       WHERE courier = 'bluedart'
         AND delivery_confirmed = false
@@ -108,74 +106,60 @@ app.post("/_cron/sync", async (req, res) => {
       LIMIT 25
     `);
 
-    if (!rows.length) {
-      return res.json({ ok: true, processed: 0 });
-    }
+    console.log("📦 DB rows fetched:", rows.length);
 
-    const awbs = rows.map(r => r.awb);
-
-    // 2️⃣ ONE API CALL FOR 25 ORDERS
-    const tracking = await trackBluedartBatch(awbs);
-
-    let processed = 0;
-
-    // 3️⃣ Update DB + Reschedule
     for (const row of rows) {
-      const t = tracking[row.awb];
-      if (!t) continue;
+      console.log("➡️ Processing AWB:", row.awb);
 
-      // 🔴 STOP — Delivered / RTO
-      if (t.statusType === "DL" || t.statusType === "RT") {
-        await pool.query(`
-          UPDATE shipments
-          SET
-            last_known_status = $1,
-            delivery_confirmed = true,
-            delivered_at = NOW(),
-            last_checked_at = NOW(),
-            next_check_at = '9999-01-01'
-          WHERE id = $2
-        `, [t.status, row.id]);
+      const tracking = await trackBluedart(row.awb);
+
+      if (!tracking) {
+        console.log("⏭️ Skipping AWB (no tracking):", row.awb);
+        continue;
       }
 
-      // 🟢 FAST — Out for Delivery / Undelivered
-      else if (t.statusType === "UD") {
-        await pool.query(`
-          UPDATE shipments
-          SET
-            last_known_status = $1,
-            last_checked_at = NOW(),
-            next_check_at = NOW() + INTERVAL '1 hour'
-          WHERE id = $2
-        `, [t.status, row.id]);
+      const isDelivered = tracking.statusType === "DL";
+
+      let nextCheck;
+
+      if (isDelivered) {
+        nextCheck = "9999-01-01";
+        console.log("🎉 Delivered:", row.awb);
+      } else {
+        nextCheck = "NOW() + INTERVAL '12 hours'";
+        console.log("🚚 In transit:", row.awb);
       }
 
-      // 🟡 SLOW — In Transit
-      else {
-        await pool.query(`
-          UPDATE shipments
-          SET
-            last_known_status = $1,
-            last_checked_at = NOW(),
-            next_check_at = NOW() + INTERVAL '12 hours'
-          WHERE id = $2
-        `, [t.status, row.id]);
-      }
+      await pool.query(
+        `
+        UPDATE shipments
+        SET
+          last_known_status = $1,
+          last_checked_at = NOW(),
+          next_check_at = ${nextCheck},
+          delivery_confirmed = $2,
+          delivered_at = CASE WHEN $2 = true THEN NOW() ELSE delivered_at END
+        WHERE awb = $3
+        `,
+        [tracking.status, isDelivered, row.awb]
+      );
 
       processed++;
+      console.log("✅ Processed count incremented:", processed);
     }
 
-    console.log(`🕒 Cron run | Processed: ${processed}`);
+    console.log("🏁 Cron sync finished | Processed:", processed);
 
     res.json({ ok: true, processed });
   } catch (err) {
-    console.error("❌ Cron crash:", err.message);
+    console.error("🔥 Cron sync crashed");
+    console.error(err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
 /* =================================================
-   🔁 RENDER KEEP-ALIVE (FREE TIER SAFE)
+   🧠 KEEP-ALIVE (RENDER)
 ================================================= */
 const SELF_URL = process.env.RENDER_EXTERNAL_URL
   ? `${process.env.RENDER_EXTERNAL_URL}/health`
@@ -192,5 +176,5 @@ if (SELF_URL) {
 ================================================= */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
-  console.log("🚀 Ops Logistics running on port", PORT)
+  console.log("🚀 Server running on port", PORT)
 );
