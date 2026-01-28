@@ -1,5 +1,5 @@
 {
-  "name": "bluedart-edd-service",
+  "name": "ops-logistics",
   "version": "1.0.0",
   "description": "EDD and Tracking API",
   "main": "index.js",
