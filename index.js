@@ -3,9 +3,9 @@ import axios from "axios";
 import xml2js from "xml2js";
 import pg from "pg";
 
-/* =========================================================
+/* ============================
    🚀 APP + DB
-========================================================= */
+============================ */
 const app = express();
 app.use(express.json());
 
@@ -15,9 +15,9 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-/* =========================================================
+/* ============================
    🌍 CORS
-========================================================= */
+============================ */
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -26,9 +26,9 @@ app.use((req, res, next) => {
   next();
 });
 
-/* =========================================================
+/* ============================
    🔑 ENV
-========================================================= */
+============================ */
 const LOGIN_ID = process.env.LOGIN_ID;
 const BD_LICENCE_KEY_TRACK = process.env.BD_LICENCE_KEY_TRACK;
 const SR_EMAIL = process.env.SHIPROCKET_EMAIL;
@@ -36,9 +36,9 @@ const SR_PASSWORD = process.env.SHIPROCKET_PASSWORD;
 
 console.log("🚀 Ops Logistics running");
 
-/* =========================================================
-   🔐 SHIPROCKET TOKEN CACHE
-========================================================= */
+/* ============================
+   🔐 SHIPROCKET TOKEN
+============================ */
 let srToken = null;
 let srTokenAt = 0;
 
@@ -55,9 +55,9 @@ async function getShiprocketToken() {
   return srToken;
 }
 
-/* =========================================================
-   🕒 TIME HELPERS (IST SAFE)
-========================================================= */
+/* ============================
+   🕒 TIME HELPERS
+============================ */
 function istNow() {
   return new Date(Date.now() + 5.5 * 60 * 60 * 1000);
 }
@@ -73,37 +73,19 @@ function computeNextCheck(status = "") {
   const s = status.toUpperCase();
   const now = Date.now();
 
-  if (s.includes("DELIVERED")) {
-    return new Date("9999-01-01");
-  }
-
-  if (s.includes("OUT FOR DELIVERY")) {
-    return new Date(now + 1 * 60 * 60 * 1000);
-  }
-
-  if (
-    s.includes("NDR") ||
-    s.includes("FAILED") ||
-    s.includes("ATTEMPT") ||
-    s.includes("NOT DELIVERED")
-  ) {
+  if (s.includes("DELIVERED")) return new Date("9999-01-01");
+  if (s.includes("OUT FOR DELIVERY")) return new Date(now + 1 * 3600000);
+  if (s.includes("NDR") || s.includes("FAILED") || s.includes("ATTEMPT"))
     return tomorrow8AM();
-  }
+  if (s.includes("TRANSIT") || s.includes("SHIP") || s.includes("PICK"))
+    return new Date(now + 6 * 3600000);
 
-  if (
-    s.includes("TRANSIT") ||
-    s.includes("SHIP") ||
-    s.includes("PICK")
-  ) {
-    return new Date(now + 6 * 60 * 60 * 1000);
-  }
-
-  return new Date(now + 24 * 60 * 60 * 1000);
+  return new Date(now + 24 * 3600000);
 }
 
-/* =========================================================
+/* ============================
    🚚 TRACKERS
-========================================================= */
+============================ */
 async function trackBluedart(awb) {
   try {
     const url =
@@ -153,65 +135,54 @@ async function trackShiprocket(awb) {
   }
 }
 
-/* =========================================================
-   💾 UPSERT TRACKING (SAFE)
-========================================================= */
+/* ============================
+   💾 UPDATE ONLY (NO INSERT)
+============================ */
 async function persistTracking(awb, payload) {
-  const statusText = payload.status || "";
-  const delivered =
-    statusText.toUpperCase().includes("DELIVERED") ? istNow() : null;
-
   await pool.query(
     `
-    INSERT INTO shipments (
-      awb,
-      tracking_source,
-      actual_courier,
-      last_known_status,
-      delivered_at,
-      last_checked_at,
-      next_check_at
-    )
-    VALUES ($1,$2,$3,$4,$5,NOW(),$6)
-    ON CONFLICT (awb)
-    DO UPDATE SET
-      tracking_source = EXCLUDED.tracking_source,
-      actual_courier = COALESCE(EXCLUDED.actual_courier, shipments.actual_courier),
-      last_known_status = EXCLUDED.last_known_status,
-      delivered_at = COALESCE(shipments.delivered_at, EXCLUDED.delivered_at),
+    UPDATE shipments
+    SET
+      tracking_source = $2,
+      actual_courier = COALESCE($3, actual_courier),
+      last_known_status = $4,
+      delivered_at = CASE
+        WHEN $4 ILIKE '%DELIVERED%' THEN COALESCE(delivered_at, NOW())
+        ELSE delivered_at
+      END,
       last_checked_at = NOW(),
-      next_check_at = EXCLUDED.next_check_at
+      next_check_at = $5,
+      updated_at = NOW()
+    WHERE awb = $1
     `,
     [
       awb,
       payload.source,
       payload.actual_courier,
-      statusText,
-      delivered,
-      computeNextCheck(statusText)
+      payload.status || "",
+      computeNextCheck(payload.status || "")
     ]
   );
 }
 
-/* =========================================================
+/* ============================
    🌐 TRACK ENDPOINT
-========================================================= */
+============================ */
 app.get("/track", async (req, res) => {
   const { awb } = req.query;
   if (!awb) return res.status(400).json({ error: "AWB required" });
 
-  let result = await trackBluedart(awb);
-  if (!result) result = await trackShiprocket(awb);
-  if (!result) return res.status(404).json({ error: "Tracking not found" });
+  let data = await trackBluedart(awb);
+  if (!data) data = await trackShiprocket(awb);
+  if (!data) return res.status(404).json({ error: "Tracking not found" });
 
-  await persistTracking(awb, result);
-
-  res.json(result);
+  await persistTracking(awb, data);
+  res.json(data);
 });
 
-/* =========================================================
-   ⏱️ CRON TRIGGER
-========================================================= */
+/* ============================
+   ⏱️ CRON
+============================ */
 app.post("/_cron/track/run", async (_, res) => {
   const { rows } = await pool.query(
     `SELECT awb FROM shipments WHERE next_check_at <= NOW() LIMIT 30`
@@ -226,9 +197,9 @@ app.post("/_cron/track/run", async (_, res) => {
   res.json({ ok: true, processed: rows.length });
 });
 
-/* =========================================================
+/* ============================
    ❤️ HEALTH
-========================================================= */
+============================ */
 app.get("/health", (_, res) => res.send("OK"));
 
 const PORT = process.env.PORT || 10000;
