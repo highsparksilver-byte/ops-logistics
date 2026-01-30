@@ -2,7 +2,6 @@ import express from "express";
 import axios from "axios";
 import xml2js from "xml2js";
 import pg from "pg";
-import crypto from "crypto";
 
 const { Pool } = pg;
 
@@ -11,7 +10,7 @@ const { Pool } = pg;
 ================================================= */
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  ssl: { rejectUnauthorized: false }
 });
 
 /* =================================================
@@ -31,22 +30,198 @@ app.use((req, res, next) => {
   next();
 });
 
-const clean = (v) => v?.replace(/\r|\n|\t/g, "").trim();
-
 /* =================================================
    🔑 ENV
 ================================================= */
-const {
-  CLIENT_ID,
-  CLIENT_SECRET,
-  LOGIN_ID,
-  BD_LICENCE_KEY_TRACK,
-  SHOPIFY_CLIENT_ID,
-  SHOPIFY_CLIENT_SECRET,
-  SHOPIFY_SCOPES,
-  SHOPIFY_API_VERSION,
-  APP_URL,
-} = process.env;
+const clean = (v) => v?.replace(/\r|\n|\t/g, "").trim();
+
+const LOGIN_ID = clean(process.env.LOGIN_ID);
+const LICENCE_KEY_TRACK = clean(process.env.BD_LICENCE_KEY_TRACK);
+
+/* =================================================
+   📦 BLUE DART (BATCH)
+================================================= */
+async function trackBluedartBatch(awbs) {
+  try {
+    const numbers = awbs.join(",");
+
+    const url =
+      "https://api.bluedart.com/servlet/RoutingServlet" +
+      `?handler=tnt&action=custawbquery&loginid=${LOGIN_ID}` +
+      `&awb=awb&numbers=${numbers}&format=xml&lickey=${LICENCE_KEY_TRACK}&verno=1&scan=1`;
+
+    const res = await axios.get(url, {
+      responseType: "text",
+      timeout: 15000
+    });
+
+    const parsed = await new Promise((resolve, reject) =>
+      xml2js.parseString(res.data, { explicitArray: false }, (err, r) =>
+        err ? reject(err) : resolve(r)
+      )
+    );
+
+    const shipments = parsed?.ShipmentData?.Shipment;
+    if (!shipments) return {};
+
+    const list = Array.isArray(shipments) ? shipments : [shipments];
+    const map = {};
+
+    for (const s of list) {
+      map[s.$.WaybillNo] = {
+        status: s.Status,
+        statusType: s.StatusType
+      };
+    }
+
+    return map;
+  } catch (e) {
+    console.error("❌ Blue Dart batch failed:", e.message);
+    return {};
+  }
+}
+
+/* =================================================
+   🧠 NEXT CHECK CALCULATOR
+================================================= */
+function calculateNextCheck(statusType) {
+  const now = new Date();
+
+  if (statusType === "DL" || statusType === "RT") {
+    return new Date("9999-01-01");
+  }
+
+  if (statusType === "UD") {
+    return new Date(now.getTime() + 60 * 60 * 1000); // 1 hour
+  }
+
+  return new Date(now.getTime() + 12 * 60 * 60 * 1000); // 12 hours
+}
+
+/* =================================================
+   ⏱️ CRON SYNC (BATCHED)
+================================================= */
+app.post("/_cron/sync", async (req, res) => {
+  try {
+    console.log("🕒 Cron sync started (batched)");
+
+    const { rows } = await pool.query(`
+      SELECT id, awb
+      FROM shipments
+      WHERE courier = 'bluedart'
+        AND delivery_confirmed = false
+        AND next_check_at <= NOW()
+      ORDER BY next_check_at ASC
+      LIMIT 25
+    `);
+
+    console.log("📦 Due shipments:", rows.length);
+    if (rows.length === 0) {
+      return res.json({ ok: true, processed: 0 });
+    }
+
+    const awbs = rows.map(r => r.awb);
+    const results = await trackBluedartBatch(awbs);
+
+    let processed = 0;
+
+    for (const row of rows) {
+      const result = results[row.awb];
+      if (!result) {
+        console.log("⏭️ No tracking for", row.awb);
+        continue;
+      }
+
+      const delivered = result.statusType === "DL";
+      const nextCheck = calculateNextCheck(result.statusType);
+
+      await pool.query(`
+        UPDATE shipments
+        SET
+          last_known_status = $1,
+          last_checked_at = NOW(),
+          next_check_at = $2,
+          delivery_confirmed = $3,
+          delivered_at = CASE WHEN $3 = true THEN NOW() ELSE delivered_at END
+        WHERE awb = $4
+      `, [
+        result.status,
+        nextCheck,
+        delivered,
+        row.awb
+      ]);
+
+      processed++;
+      console.log("✅", row.awb, "→", result.statusType);
+    }
+
+    console.log("🏁 Cron finished | Processed:", processed);
+    res.json({ ok: true, processed });
+
+  } catch (err) {
+    console.error("🔥 Cron crashed:", err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/* =================================================
+   🧠 PHASE 7 — CUSTOMER TRACKING (SMART)
+================================================= */
+app.post("/track/customer", async (req, res) => {
+  const { phone, email, order_id } = req.body;
+
+  if (!phone && !email && !order_id) {
+    return res.status(400).json({
+      error: "Provide phone, email, or order_id"
+    });
+  }
+
+  let where = [];
+  let values = [];
+
+  if (phone) {
+    values.push(phone);
+    where.push(`customer_mobile = $${values.length}`);
+  }
+
+  if (email) {
+    values.push(email);
+    where.push(`customer_email = $${values.length}`);
+  }
+
+  if (order_id) {
+    values.push(order_id);
+    where.push(`shopify_order_id = $${values.length}`);
+  }
+
+  const { rows } = await pool.query(`
+    SELECT *
+    FROM shipments
+    WHERE ${where.join(" OR ")}
+    ORDER BY created_at DESC
+  `, values);
+
+  if (rows.length === 0) {
+    return res.status(404).json({ error: "No orders found" });
+  }
+
+  const active = rows.filter(r => r.delivery_confirmed === false);
+  const delivered = rows.filter(r => r.delivery_confirmed === true);
+
+  if (active.length > 0) {
+    return res.json({
+      mode: "ACTIVE_ONLY",
+      count: active.length,
+      orders: active
+    });
+  }
+
+  return res.json({
+    mode: "LATEST_DELIVERED",
+    count: 1,
+    orders: [delivered[0]]
+  });
+});
 
 /* =================================================
    ❤️ HEALTH
@@ -54,158 +229,7 @@ const {
 app.get("/health", (_, res) => res.send("OK"));
 
 /* =================================================
-   📦 CUSTOMER TRACKING — PHASE 7.2
-================================================= */
-/*
-Rules:
-1️⃣ Customer can search via phone OR email OR order_id
-2️⃣ If ANY active order exists → show ONLY active orders
-3️⃣ If NO active orders → show ONLY latest delivered order
-4️⃣ If multiple active → return list
-*/
-
-app.post("/track/customer", async (req, res) => {
-  try {
-    const { phone, email, order_id } = req.body;
-
-    if (!phone && !email && !order_id) {
-      return res.status(400).json({
-        error: "Provide phone OR email OR order_id",
-      });
-    }
-
-    const conditions = [];
-    const values = [];
-
-    if (phone) {
-      values.push(phone);
-      conditions.push(`customer_mobile = $${values.length}`);
-    }
-
-    if (email) {
-      values.push(email);
-      conditions.push(`customer_email = $${values.length}`);
-    }
-
-    if (order_id) {
-      values.push(order_id);
-      conditions.push(`shopify_order_id = $${values.length}`);
-    }
-
-    const whereClause = conditions.join(" OR ");
-
-    /* ---------- 1️⃣ FETCH ALL MATCHING ORDERS ---------- */
-    const { rows } = await pool.query(
-      `
-      SELECT *
-      FROM shipments
-      WHERE ${whereClause}
-      ORDER BY created_at DESC
-      `,
-      values
-    );
-
-    if (rows.length === 0) {
-      return res.status(404).json({ error: "No orders found" });
-    }
-
-    /* ---------- 2️⃣ SPLIT ACTIVE VS DELIVERED ---------- */
-    const activeOrders = rows.filter(
-      (o) => o.delivery_confirmed === false
-    );
-
-    // 🟢 CASE A: ANY ACTIVE → SHOW ONLY ACTIVE
-    if (activeOrders.length > 0) {
-      return res.json({
-        mode: "ACTIVE_ONLY",
-        count: activeOrders.length,
-        orders: activeOrders.map(formatOrder),
-      });
-    }
-
-    // 🔵 CASE B: ALL DELIVERED → SHOW LATEST ONE ONLY
-    const latestDelivered = rows[0];
-
-    return res.json({
-      mode: "LATEST_DELIVERED",
-      count: 1,
-      orders: [formatOrder(latestDelivered)],
-    });
-  } catch (err) {
-    console.error("❌ Customer tracking failed:", err.message);
-    res.status(500).json({ error: "Tracking failed" });
-  }
-});
-
-/* =================================================
-   🧩 FORMATTER
-================================================= */
-function formatOrder(row) {
-  return {
-    order_id: row.shopify_order_id,
-    order_name: row.shopify_order_name,
-    awb: row.awb,
-    courier: row.courier,
-    status: row.last_known_status,
-    delivered: row.delivery_confirmed,
-    delivered_at: row.delivered_at,
-    last_checked_at: row.last_checked_at,
-  };
-}
-
-/* =================================================
-   🔑 SHOPIFY OAUTH (ALREADY INSTALLED)
-================================================= */
-app.get("/auth/shopify", (req, res) => {
-  const { shop } = req.query;
-  if (!shop) return res.status(400).send("Missing shop");
-
-  const state = crypto.randomBytes(16).toString("hex");
-  const redirectUri = `${APP_URL}/auth/shopify/callback`;
-
-  const installUrl =
-    `https://${shop}/admin/oauth/authorize` +
-    `?client_id=${SHOPIFY_CLIENT_ID}` +
-    `&scope=${SHOPIFY_SCOPES}` +
-    `&redirect_uri=${redirectUri}` +
-    `&state=${state}`;
-
-  res.redirect(installUrl);
-});
-
-app.get("/auth/shopify/callback", async (req, res) => {
-  try {
-    const { shop, code, hmac } = req.query;
-    if (!shop || !code || !hmac) return res.status(400).send("Missing params");
-
-    const query = { ...req.query };
-    delete query.hmac;
-    delete query.signature;
-
-    const message = new URLSearchParams(query).toString();
-    const generatedHmac = crypto
-      .createHmac("sha256", SHOPIFY_CLIENT_SECRET)
-      .update(message)
-      .digest("hex");
-
-    if (generatedHmac !== hmac) {
-      return res.status(401).send("HMAC validation failed");
-    }
-
-    await axios.post(`https://${shop}/admin/oauth/access_token`, {
-      client_id: SHOPIFY_CLIENT_ID,
-      client_secret: SHOPIFY_CLIENT_SECRET,
-      code,
-    });
-
-    res.send("✅ App Installed Successfully");
-  } catch (err) {
-    res.status(500).send("OAuth failed");
-  }
-});
-
-/* =================================================
-   🚀 START SERVER
+   🚀 START
 ================================================= */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
