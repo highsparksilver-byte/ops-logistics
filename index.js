@@ -31,8 +31,12 @@ app.use((req, res, next) => {
 ================================ */
 const clean = (v) => v?.replace(/\r|\n|\t/g, "").trim();
 
+const CLIENT_ID = clean(process.env.CLIENT_ID);
+const CLIENT_SECRET = clean(process.env.CLIENT_SECRET);
 const LOGIN_ID = clean(process.env.LOGIN_ID);
-const BD_TRACK_KEY = clean(process.env.BD_LICENCE_KEY_TRACK);
+
+const LICENCE_KEY_EDD = clean(process.env.BD_LICENCE_KEY_EDD);
+const LICENCE_KEY_TRACK = clean(process.env.BD_LICENCE_KEY_TRACK);
 
 const SR_EMAIL = clean(process.env.SHIPROCKET_EMAIL);
 const SR_PASSWORD = clean(process.env.SHIPROCKET_PASSWORD);
@@ -40,22 +44,32 @@ const SR_PASSWORD = clean(process.env.SHIPROCKET_PASSWORD);
 console.log("🚀 Ops Logistics running");
 
 /* ===============================
-   🔐 SHIPROCKET AUTH
+   🔐 JWT CACHE
 ================================ */
-let srToken = null;
-let srTokenAt = 0;
+let bdJwt = null, bdJwtAt = 0;
+let srJwt = null, srJwtAt = 0;
+
+async function getBluedartJwt() {
+  if (bdJwt && Date.now() - bdJwtAt < 23 * 60 * 60 * 1000) return bdJwt;
+  const r = await axios.get(
+    "https://apigateway.bluedart.com/in/transportation/token/v1/login",
+    { headers: { Accept: "application/json", ClientID: CLIENT_ID, clientSecret: CLIENT_SECRET } }
+  );
+  bdJwt = r.data.JWTToken;
+  bdJwtAt = Date.now();
+  return bdJwt;
+}
 
 async function getShiprocketJwt() {
-  if (srToken && Date.now() - srTokenAt < 8 * 24 * 60 * 60 * 1000) {
-    return srToken;
-  }
+  if (!SR_EMAIL || !SR_PASSWORD) return null;
+  if (srJwt && Date.now() - srJwtAt < 8 * 24 * 60 * 60 * 1000) return srJwt;
   const r = await axios.post(
     "https://apiv2.shiprocket.in/v1/external/auth/login",
     { email: SR_EMAIL, password: SR_PASSWORD }
   );
-  srToken = r.data.token;
-  srTokenAt = Date.now();
-  return srToken;
+  srJwt = r.data.token;
+  srJwtAt = Date.now();
+  return srJwt;
 }
 
 /* ===============================
@@ -63,23 +77,23 @@ async function getShiprocketJwt() {
 ================================ */
 async function trackBluedart(awb) {
   try {
-    const url = `https://api.bluedart.com/servlet/RoutingServlet?handler=tnt&action=custawbquery&loginid=${LOGIN_ID}&awb=awb&numbers=${awb}&format=xml&lickey=${BD_TRACK_KEY}&verno=1&scan=1`;
+    const url = `https://api.bluedart.com/servlet/RoutingServlet?handler=tnt&action=custawbquery&loginid=${LOGIN_ID}&awb=awb&numbers=${awb}&format=xml&lickey=${LICENCE_KEY_TRACK}&verno=1&scan=1`;
     const r = await axios.get(url, { responseType: "text", timeout: 8000 });
     const parsed = await new Promise((res, rej) =>
       xml2js.parseString(r.data, { explicitArray: false }, (e, o) => e ? rej(e) : res(o))
     );
-
     const s = parsed?.ShipmentData?.Shipment;
     if (!s) return null;
 
     return {
       source: "bluedart",
       actual_courier: "Blue Dart",
-      status: s.Status,
-      statusType: s.StatusType,
-      scans: Array.isArray(s.Scans?.ScanDetail)
-        ? s.Scans.ScanDetail
-        : s.Scans?.ScanDetail ? [s.Scans.ScanDetail] : []
+      status: s.Status || "",
+      scans: s.Scans?.ScanDetail
+        ? Array.isArray(s.Scans.ScanDetail)
+          ? s.Scans.ScanDetail
+          : [s.Scans.ScanDetail]
+        : []
     };
   } catch {
     return null;
@@ -89,22 +103,20 @@ async function trackBluedart(awb) {
 async function trackShiprocket(awb) {
   try {
     const token = await getShiprocketJwt();
+    if (!token) return null;
+
     const r = await axios.get(
       `https://apiv2.shiprocket.in/v1/external/courier/track/awb/${awb}`,
       { headers: { Authorization: `Bearer ${token}` }, timeout: 8000 }
     );
 
-    const td = r.data.tracking_data;
+    const td = r.data?.tracking_data;
     if (!td) return null;
-
-    const courierFromTrack =
-      td.shipment_track?.[0]?.courier_name || null;
 
     return {
       source: "shiprocket",
-      actual_courier: courierFromTrack,
-      status: td.current_status,
-      statusType: td.shipment_status,
+      actual_courier: td.courier_name || null,
+      status: td.current_status || "",
       scans: td.shipment_track_activities || []
     };
   } catch {
@@ -113,7 +125,7 @@ async function trackShiprocket(awb) {
 }
 
 /* ===============================
-   💾 PERSIST TRACKING (UPSERT)
+   💾 PERSIST TRACKING (FIXED)
 ================================ */
 async function persistTracking(awb, data) {
   const delivered = /DELIVERED/i.test(data.status || "");
@@ -121,14 +133,31 @@ async function persistTracking(awb, data) {
   await pool.query(
     `
     INSERT INTO shipments (
+      shopify_order_id,
+      shopify_order_name,
+      fulfillment_id,
       awb,
+      courier,
+      customer_mobile,
       tracking_source,
       actual_courier,
       last_known_status,
       delivered_at,
       next_check_at
     )
-    VALUES ($1,$2,$3,$4,$5,$6)
+    VALUES (
+      'TRACKING_ONLY',
+      'TRACKING_ONLY',
+      'TRACKING_ONLY',
+      $1,
+      $2,
+      'NA',
+      $3,
+      $4,
+      $5,
+      $6,
+      $7
+    )
     ON CONFLICT (awb)
     DO UPDATE SET
       tracking_source = EXCLUDED.tracking_source,
@@ -140,41 +169,58 @@ async function persistTracking(awb, data) {
     `,
     [
       awb,
+      data.source === "shiprocket" ? "SHIPROCKET" : "BLUEDART",
       data.source,
       data.actual_courier,
       delivered ? "DELIVERED" : "IN TRANSIT",
       delivered ? new Date() : null,
-      delivered ? new Date("9999-01-01") : new Date(Date.now() + 6 * 60 * 60 * 1000)
+      delivered
+        ? new Date("9999-01-01")
+        : new Date(Date.now() + 6 * 60 * 60 * 1000)
     ]
   );
 }
 
 /* ===============================
-   🚚 TRACK ROUTE
+   🌐 ROUTES
 ================================ */
 app.get("/track", async (req, res) => {
   const { awb } = req.query;
   if (!awb) return res.status(400).json({ error: "AWB required" });
 
-  const { rows } = await pool.query(
-    "SELECT tracking_source FROM shipments WHERE awb=$1",
-    [awb]
-  );
-
-  let data = null;
-
-  if (rows.length && rows[0].tracking_source === "shiprocket") {
-    data = await trackShiprocket(awb);
-    if (!data) data = await trackBluedart(awb);
-  } else {
-    data = await trackBluedart(awb);
-    if (!data) data = await trackShiprocket(awb);
-  }
-
+  let data = await trackBluedart(awb);
+  if (!data) data = await trackShiprocket(awb);
   if (!data) return res.status(404).json({ error: "Tracking details not found" });
 
   await persistTracking(awb, data);
   res.json(data);
+});
+
+/* ===============================
+   ⏱️ CRON
+================================ */
+app.post("/_cron/track/run", async (_, res) => {
+  const { rows } = await pool.query(
+    `SELECT awb, tracking_source FROM shipments
+     WHERE next_check_at <= now()
+     AND delivery_confirmed = false
+     LIMIT 50`
+  );
+
+  let processed = 0;
+  for (const r of rows) {
+    let data =
+      r.tracking_source === "shiprocket"
+        ? await trackShiprocket(r.awb) || await trackBluedart(r.awb)
+        : await trackBluedart(r.awb) || await trackShiprocket(r.awb);
+
+    if (data) {
+      await persistTracking(r.awb, data);
+      processed++;
+    }
+  }
+
+  res.json({ ok: true, processed });
 });
 
 /* ===============================
