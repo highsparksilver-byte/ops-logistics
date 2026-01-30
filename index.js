@@ -241,11 +241,36 @@ async function trackShiprocket(awb) {
 app.get("/track", async (req,res)=>{
   const {awb} = req.query;
   if (!awb) return res.status(400).json({error:"AWB required"});
-  const {rows} = await pool.query(
-    "SELECT tracking_source FROM shipments WHERE awb=$1",[awb]
-  );
-  const src = rows[0]?.tracking_source || "bluedart";
-  let data = src==="shiprocket" ? await trackShiprocket(awb) : await trackBluedart(awb);
+  const { rows } = await pool.query(
+  "SELECT tracking_source FROM shipments WHERE awb=$1",
+  [awb]
+);
+
+let data = null;
+
+// 1️⃣ If shipment exists, respect stored source
+if (rows.length > 0) {
+  const src = rows[0].tracking_source;
+
+  if (src === "shiprocket") {
+    data = await trackShiprocket(awb);
+    if (!data) data = await trackBluedart(awb);
+  } else {
+    data = await trackBluedart(awb);
+    if (!data) data = await trackShiprocket(awb);
+  }
+}
+// 2️⃣ If NOT in DB → auto-detect (Blue Dart → Shiprocket)
+else {
+  data = await trackBluedart(awb);
+  if (!data) data = await trackShiprocket(awb);
+}
+
+if (!data) {
+  return res.status(404).json({ error: "Tracking details not found" });
+}
+
+res.json(data);
   if (!data && src!=="shiprocket") data = await trackShiprocket(awb);
   if (!data) return res.status(404).json({error:"Not found"});
   res.json(data);
