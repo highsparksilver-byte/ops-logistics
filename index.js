@@ -1,33 +1,13 @@
 import express from "express";
-import crypto from "crypto";
+import axios from "axios";
+import xml2js from "xml2js";
 import pg from "pg";
 
 const app = express();
+app.use(express.json());
 
 /* ===============================
-   RAW BODY (SHOPIFY HMAC)
-================================ */
-app.use(
-  express.json({
-    verify: (req, res, buf) => {
-      req.rawBody = buf;
-    }
-  })
-);
-
-/* ===============================
-   CORS
-================================ */
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") return res.sendStatus(200);
-  next();
-});
-
-/* ===============================
-   ENV
+   DB
 ================================ */
 const { Pool } = pg;
 const pool = new Pool({
@@ -35,106 +15,243 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET;
-
 /* ===============================
-   HMAC VERIFY
+   UTILS
 ================================ */
-function verifyShopify(req) {
-  const hmac = req.get("X-Shopify-Hmac-Sha256");
-  if (!hmac || !req.rawBody) return false;
+function istNow() {
+  const d = new Date();
+  return new Date(d.getTime() + (330 + d.getTimezoneOffset()) * 60000);
+}
 
-  const digest = crypto
-    .createHmac("sha256", SHOPIFY_WEBHOOK_SECRET)
-    .update(req.rawBody)
-    .digest("base64");
+function isQuietHours(d = istNow()) {
+  const h = d.getHours();
+  return h >= 0 && h < 7;
+}
 
-  return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac));
+function nextMorning7am(from = istNow()) {
+  const d = new Date(from);
+  d.setDate(d.getDate() + 1);
+  d.setHours(7, 0, 0, 0);
+  return d;
 }
 
 /* ===============================
-   SLA CALC
+   STATUS HELPERS
 ================================ */
-function nextCheck(status, firstNdrAt) {
-  const now = new Date();
+function isDelivered(s = "") {
+  return s.toUpperCase().includes("DELIVERED");
+}
 
-  if (!status) return new Date(now.getTime() + 24 * 3600 * 1000);
+function isOFD(s = "") {
+  return s.toUpperCase().includes("OUT FOR DELIVERY");
+}
 
-  const s = status.toUpperCase();
+function isNDR(s = "") {
+  return (
+    s.toUpperCase().includes("NDR") ||
+    s.toUpperCase().includes("UNDELIVERED") ||
+    s.toUpperCase().includes("FAILED")
+  );
+}
 
-  if (s.includes("DELIVERED")) return new Date("9999-01-01");
+function isRTO(s = "") {
+  return s.toUpperCase().includes("RTO");
+}
 
-  if (s.includes("OUT FOR DELIVERY"))
-    return new Date(now.getTime() + 60 * 60 * 1000);
+/* ===============================
+   SLA ENGINE (FINAL v3)
+================================ */
+function computeNextCheck({
+  status,
+  firstNdrAt,
+  lastCheckedAt
+}) {
+  const now = istNow();
 
-  if (s.includes("NDR") || s.includes("FAILED")) {
-    if (!firstNdrAt)
-      return new Date(now.getTime() + 6 * 3600 * 1000);
-
-    const hours = (now - new Date(firstNdrAt)) / 3600000;
-    return new Date(
-      now.getTime() + (hours < 24 ? 6 : 2) * 3600 * 1000
-    );
+  if (isDelivered(status) || isRTO(status)) {
+    return new Date("9999-01-01");
   }
 
-  return new Date(now.getTime() + 24 * 3600 * 1000);
+  if (isQuietHours(now)) {
+    return new Date(now.setHours(7, 0, 0, 0));
+  }
+
+  // -------- OUT FOR DELIVERY --------
+  if (isOFD(status)) {
+    const next = new Date(now);
+    next.setHours(next.getHours() + 1);
+    return next;
+  }
+
+  // -------- NDR LOGIC --------
+  if (isNDR(status)) {
+    const first = firstNdrAt ? new Date(firstNdrAt) : now;
+    const hoursSinceFirst =
+      (now - first) / (1000 * 60 * 60);
+
+    // Same day
+    if (hoursSinceFirst < 2) return new Date(now.setHours(now.getHours() + 2));
+    if (hoursSinceFirst < 6) return new Date(now.setHours(now.getHours() + 6));
+    if (hoursSinceFirst < 14) return new Date(now.setHours(now.getHours() + 14));
+
+    // End of day → quiet hours
+    if (now.getHours() >= 22) {
+      return nextMorning7am(now);
+    }
+
+    // Day 0 tail
+    if (hoursSinceFirst < 24) {
+      return new Date(now.setHours(now.getHours() + 2));
+    }
+
+    // Day 1+
+    return new Date(now.setHours(now.getHours() + 3));
+  }
+
+  // -------- IN TRANSIT --------
+  const next = new Date(now);
+  next.setHours(next.getHours() + 12);
+  return next;
 }
 
 /* ===============================
-   OPS CLASSIFIER
+   TRACKERS
 ================================ */
-function classify(status) {
-  if (!status) return "clean";
-  const s = status.toUpperCase();
+async function trackBluedart(awb) {
+  try {
+    const url = `https://api.bluedart.com/servlet/RoutingServlet?handler=tnt&action=custawbquery&awb=awb&numbers=${awb}&format=xml`;
+    const r = await axios.get(url, { timeout: 8000 });
+    const parsed = await xml2js.parseStringPromise(r.data, { explicitArray: false });
+    const s = parsed?.ShipmentData?.Shipment;
+    if (!s) return null;
 
-  if (s.includes("OUT FOR DELIVERY")) return "out_for_delivery";
-  if (s.includes("NDR") || s.includes("FAILED")) return "ndr";
+    return {
+      source: "bluedart",
+      actual_courier: "Blue Dart",
+      status: s.Status || "",
+      scans: s.Scans?.ScanDetail || []
+    };
+  } catch {
+    return null;
+  }
+}
 
-  return "clean";
+async function trackShiprocket(awb) {
+  try {
+    const token = process.env.SHIPROCKET_TOKEN;
+    const r = await axios.get(
+      `https://apiv2.shiprocket.in/v1/external/courier/track/awb/${awb}`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+
+    const td = r.data.tracking_data;
+    return {
+      source: "shiprocket",
+      actual_courier: td.courier_name || null,
+      status: td.current_status || "",
+      scans: td.shipment_track_activities || []
+    };
+  } catch {
+    return null;
+  }
 }
 
 /* ===============================
-   CRON TRACK
+   PERSIST (SAFE UPSERT)
 ================================ */
-app.post("/_cron/track/run", async (_, res) => {
-  const { rows } = await pool.query(
-    `SELECT id, awb, last_known_status, first_ndr_at
-     FROM shipments
-     WHERE next_check_at <= NOW()
-     LIMIT 50`
+async function persistTracking(awb, data) {
+  const now = istNow();
+
+  const existing = await pool.query(
+    "SELECT first_ndr_at FROM shipments WHERE awb=$1",
+    [awb]
   );
 
-  for (const r of rows) {
-    const next = nextCheck(r.last_known_status, r.first_ndr_at);
-    await pool.query(
-      `UPDATE shipments
-       SET next_check_at = $1, updated_at = NOW()
-       WHERE id = $2`,
-      [next, r.id]
-    );
+  let firstNdrAt = existing.rows[0]?.first_ndr_at || null;
+
+  // Reset NDR memory if OFD
+  if (isOFD(data.status)) {
+    firstNdrAt = null;
   }
 
-  res.json({ ok: true, processed: rows.length });
+  // Set first NDR
+  if (isNDR(data.status) && !firstNdrAt) {
+    firstNdrAt = now;
+  }
+
+  const nextCheck = computeNextCheck({
+    status: data.status,
+    firstNdrAt,
+    lastCheckedAt: now
+  });
+
+  await pool.query(
+    `
+    INSERT INTO shipments (
+      awb, tracking_source, actual_courier,
+      last_known_status, last_checked_at,
+      next_check_at, delivered_at, first_ndr_at
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,
+      CASE WHEN $4 ILIKE '%DELIVERED%' THEN NOW() ELSE NULL END,
+      $7
+    )
+    ON CONFLICT (awb) DO UPDATE SET
+      tracking_source = EXCLUDED.tracking_source,
+      actual_courier = EXCLUDED.actual_courier,
+      last_known_status = EXCLUDED.last_known_status,
+      last_checked_at = EXCLUDED.last_checked_at,
+      next_check_at = EXCLUDED.next_check_at,
+      delivered_at = EXCLUDED.delivered_at,
+      first_ndr_at = EXCLUDED.first_ndr_at
+    `,
+    [
+      awb,
+      data.source,
+      data.actual_courier,
+      data.status,
+      now,
+      nextCheck,
+      firstNdrAt
+    ]
+  );
+}
+
+/* ===============================
+   TRACK ENDPOINT
+================================ */
+app.get("/track", async (req, res) => {
+  const { awb } = req.query;
+  if (!awb) return res.status(400).json({ error: "awb_required" });
+
+  let data = await trackBluedart(awb);
+  if (!data) data = await trackShiprocket(awb);
+  if (!data) return res.status(404).json({ error: "not_found" });
+
+  await persistTracking(awb, data);
+  res.json(data);
 });
 
 /* ===============================
-   OPS DASHBOARD
+   CRON
 ================================ */
-app.get("/ops/dashboard", async (_, res) => {
-  const { rows } = await pool.query(`
-    SELECT awb, last_known_status
-    FROM shipments
-    WHERE delivered_at IS NULL
-  `);
+app.post("/_cron/track/run", async (_, res) => {
+  const { rows } = await pool.query(
+    "SELECT awb FROM shipments WHERE next_check_at <= NOW() LIMIT 50"
+  );
 
-  const out = { attention: [], ndr: [], out_for_delivery: [] };
+  let processed = 0;
 
   for (const r of rows) {
-    const bucket = classify(r.last_known_status);
-    if (bucket !== "clean") out[bucket].push(r);
+    let d = await trackBluedart(r.awb);
+    if (!d) d = await trackShiprocket(r.awb);
+    if (d) {
+      await persistTracking(r.awb, d);
+      processed++;
+    }
   }
 
-  res.json(out);
+  res.json({ ok: true, processed });
 });
 
 /* ===============================
