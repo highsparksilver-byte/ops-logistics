@@ -19,7 +19,7 @@ app.use((req, res, next) => {
 const clean = (v) => v?.replace(/\r|\n|\t/g, "").trim();
 
 /* =================================================
-   🔑 ENV VARIABLES
+   🔑 CREDENTIALS
 ================================================= */
 const CLIENT_ID = clean(process.env.CLIENT_ID);
 const CLIENT_SECRET = clean(process.env.CLIENT_SECRET);
@@ -31,7 +31,7 @@ const LICENCE_KEY_TRACK = clean(process.env.BD_LICENCE_KEY_TRACK);
 const SR_EMAIL = clean(process.env.SHIPROCKET_EMAIL);
 const SR_PASSWORD = clean(process.env.SHIPROCKET_PASSWORD);
 
-console.log("🚀 EDD + Tracking Server Starting...");
+console.log("🚀 Ops Logistics starting...");
 console.log("📍 Warehouse: Pune (411022)");
 
 /* =================================================
@@ -100,8 +100,8 @@ function getIndiaDate() {
 
 function isNonWorkingDay(d) {
   const day = d.getDay();
-  const iso = d.toISOString().slice(0, 10);
-  return day === 0 || HOLIDAYS.includes(iso);
+  const ymd = d.toISOString().slice(0, 10);
+  return day === 0 || HOLIDAYS.includes(ymd);
 }
 
 function calculatePickupDate() {
@@ -124,13 +124,12 @@ function calculatePickupDate() {
 ================================================= */
 function parseBlueDartDate(str) {
   if (!str) return null;
-  const map = {
+  const [dd, mon, yyyy] = str.split("-");
+  const months = {
     jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
-    jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11
+    jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
   };
-  const p = str.split("-");
-  if (p.length !== 3) return null;
-  return new Date(Date.UTC(Number(p[2]), map[p[1].toLowerCase()], Number(p[0])));
+  return new Date(Date.UTC(yyyy, months[mon.toLowerCase()], dd));
 }
 
 function calculateConfidenceBand(eddStr) {
@@ -144,63 +143,71 @@ function calculateConfidenceBand(eddStr) {
     max.setUTCDate(max.getUTCDate() + 1);
   }
 
-  const m = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
-  const f = d => `${d.getUTCDate()} ${m[d.getUTCMonth()]}`;
+  const fmt = (d) =>
+    `${d.getUTCDate()} ${["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][d.getUTCMonth()]}`;
 
   return min.getUTCMonth() === max.getUTCMonth()
-    ? `${min.getUTCDate()}–${f(max)}`
-    : `${f(min)} – ${f(max)}`;
+    ? `${min.getUTCDate()}–${fmt(max)}`
+    : `${fmt(min)} – ${fmt(max)}`;
 }
 
 /* =================================================
-   🏙️ CITY LOOKUP
+   🛡️ EDD RATE LIMIT (LIGHT)
 ================================================= */
-async function getCity(pincode) {
-  try {
-    const res = await axios.get(
-      `https://api.postalpincode.in/pincode/${pincode}`,
-      { timeout: 3000 }
-    );
-    if (res.data?.[0]?.Status === "Success") {
-      return res.data[0].PostOffice[0].District;
-    }
-  } catch {}
-  return null;
+const eddRateMap = new Map();
+
+function allowEdd(ip) {
+  const now = Date.now();
+  const limit = 20;
+  const windowMs = 60 * 60 * 1000;
+
+  const e = eddRateMap.get(ip) || { count: 0, ts: now };
+
+  if (now - e.ts > windowMs) {
+    e.count = 0;
+    e.ts = now;
+  }
+
+  e.count++;
+  eddRateMap.set(ip, e);
+
+  return e.count <= limit;
 }
 
 /* =================================================
-   ⚡ EXPRESS BADGE
+   🧠 DAILY EDD CACHE
 ================================================= */
-function getExpressBadge(eddStr, city) {
-  if (!eddStr) return "STANDARD";
-
-  const min = parseBlueDartDate(eddStr);
-  if (!min) return "STANDARD";
-
-  const today = getIndiaDate();
-  const diff =
-    Math.round((min - today) / (1000 * 60 * 60 * 24));
-
-  const metros = [
-    "MUMBAI","DELHI","BANGALORE","BENGALURU",
-    "PUNE","CHENNAI","HYDERABAD","KOLKATA"
-  ];
-
-  const isMetro = metros.some(m => (city || "").toUpperCase().includes(m));
-
-  if (isMetro && diff <= 2) return "METRO_EXPRESS";
-  if (diff <= 3) return "EXPRESS";
-  return "STANDARD";
-}
+const eddCache = new Map();
 
 /* =================================================
-   📦 EDD API (BLUEDART + SHIPROCKET)
+   🛣️ EDD ROUTE
 ================================================= */
-async function getBluedartEdd(pincode) {
+app.post("/edd", async (req, res) => {
+  const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
+
+  if (!allowEdd(ip)) {
+    return res.status(429).json({ error: "Too many requests" });
+  }
+
+  let { pincode } = req.body;
+  pincode = String(pincode || "").trim();
+
+  if (!/^[1-9][0-9]{5}$/.test(pincode)) {
+    return res.status(400).json({ error: "Invalid pincode" });
+  }
+
+  const today = getIndiaDate().toISOString().slice(0, 10);
+  const key = `${pincode}-${today}`;
+
+  if (eddCache.has(key)) {
+    return res.json({ ...eddCache.get(key), cached: true });
+  }
+
+  let edd = null;
+
   try {
     const jwt = await getBluedartJwt();
-
-    const res = await axios.post(
+    const r = await axios.post(
       "https://apigateway.bluedart.com/in/transportation/transit/v1/GetDomesticTransitTimeForPinCodeandProduct",
       {
         pPinCodeFrom: "411022",
@@ -209,77 +216,35 @@ async function getBluedartEdd(pincode) {
         pSubProductCode: "P",
         pPudate: calculatePickupDate(),
         pPickupTime: "16:00",
-        profile: {
-          Api_type: "S",
-          LicenceKey: LICENCE_KEY_EDD,
-          LoginID: LOGIN_ID,
-        },
+        profile: { Api_type: "S", LicenceKey: LICENCE_KEY_EDD, LoginID: LOGIN_ID },
       },
       { headers: { JWTToken: jwt } }
     );
 
-    return (
-      res.data?.GetDomesticTransitTimeForPinCodeandProductResult
-        ?.ExpectedDateDelivery || null
-    );
-  } catch {
-    return null;
-  }
-}
+    edd =
+      r.data?.GetDomesticTransitTimeForPinCodeandProductResult
+        ?.ExpectedDateDelivery || null;
+  } catch {}
 
-async function getShiprocketEdd(pincode) {
-  try {
-    const token = await getShiprocketJwt();
-    if (!token) return null;
+  if (!edd) {
+    try {
+      const token = await getShiprocketJwt();
+      if (token) {
+        const sr = await axios.get(
+          `https://apiv2.shiprocket.in/v1/external/courier/serviceability/?pickup_postcode=411022&delivery_postcode=${pincode}&cod=1&weight=0.5`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
 
-    const res = await axios.get(
-      `https://apiv2.shiprocket.in/v1/external/courier/serviceability/?pickup_postcode=411022&delivery_postcode=${pincode}&cod=1&weight=0.5`,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-
-    const c = res.data?.data?.available_courier_companies || [];
-    return c[0]?.etd ? c[0].etd.split(" ")[0] : null;
-  } catch {
-    return null;
-  }
-}
-
-/* =================================================
-   🧠 DAILY PINCODE CACHE (KEY PART)
-================================================= */
-const eddCache = new Map();
-
-function eddCacheKey(pincode) {
-  return `${pincode}-${getIndiaDate().toISOString().slice(0, 10)}`;
-}
-
-// clear once per day (safety)
-setInterval(() => eddCache.clear(), 24 * 60 * 60 * 1000);
-
-/* =================================================
-   🚚 EDD ROUTE (WIDGET)
-================================================= */
-app.post("/edd", async (req, res) => {
-  const { pincode } = req.body;
-  if (!pincode) return res.status(400).json({ error: "Pincode required" });
-
-  const key = eddCacheKey(pincode);
-  if (eddCache.has(key)) {
-    return res.json({ ...eddCache.get(key), cached: true });
+        const c = sr.data?.data?.available_courier_companies;
+        if (c?.length) edd = c[0].etd;
+      }
+    } catch {}
   }
 
-  const [city, bd] = await Promise.all([
-    getCity(pincode),
-    getBluedartEdd(pincode),
-  ]);
-
-  const edd = bd || (await getShiprocketEdd(pincode));
   const response = {
     edd: edd || null,
     edd_display: edd ? calculateConfidenceBand(edd) : null,
-    city,
-    badge: getExpressBadge(edd, city),
-    cached: false,
+    badge: edd ? "STANDARD" : null,
   };
 
   if (edd) eddCache.set(key, response);
@@ -293,5 +258,5 @@ app.get("/health", (_, res) => res.send("OK"));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
-  console.log("🚀 EDD Widget live on port", PORT)
+  console.log("🚀 Ops Logistics running on port", PORT)
 );
