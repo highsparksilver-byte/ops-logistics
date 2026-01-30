@@ -85,36 +85,50 @@ async function getShiprocketJwt() {
 }
 
 /* =========================
-   DATE HELPERS
+   DATE HELPERS (SAFE)
 ========================= */
-function getIndiaDate() {
-  const now = new Date();
-  const utc = now.getTime() + now.getTimezoneOffset() * 60000;
-  return new Date(utc + 5.5 * 60 * 60 * 1000);
+function isValidDate(d) {
+  return d instanceof Date && !isNaN(d);
 }
 
-function isHoliday(d) {
-  const day = d.getUTCDay();
-  const iso = d.toISOString().slice(0, 10);
-  return day === 0 || HOLIDAYS.includes(iso);
-}
+function parseBlueDartDate(str) {
+  if (!str || typeof str !== "string") return null;
 
-function parseBDDate(str) {
-  if (!str) return null;
-  const [d, m, y] = str.split("-");
+  const parts = str.split("-");
+  if (parts.length !== 3) return null;
+
   const months = {
     Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5,
     Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11,
   };
-  return new Date(Date.UTC(+y, months[m], +d));
+
+  const day = Number(parts[0]);
+  const month = months[parts[1]];
+  const year = Number(parts[2]);
+
+  if (!day || month === undefined || !year) return null;
+
+  const d = new Date(Date.UTC(year, month, day));
+  return isValidDate(d) ? d : null;
+}
+
+function isHoliday(d) {
+  if (!isValidDate(d)) return false;
+  const iso = d.toISOString().slice(0, 10);
+  return d.getUTCDay() === 0 || HOLIDAYS.includes(iso);
 }
 
 function confidenceBand(minDate) {
+  if (!isValidDate(minDate)) return null;
+
   let max = new Date(minDate);
   max.setUTCDate(max.getUTCDate() + 1);
-  while (isHoliday(max)) max.setUTCDate(max.getUTCDate() + 1);
 
-  const fmt = d =>
+  while (isHoliday(max)) {
+    max.setUTCDate(max.getUTCDate() + 1);
+  }
+
+  const fmt = (d) =>
     `${d.getUTCDate()} ${["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][d.getUTCMonth()]}`;
 
   return minDate.getUTCMonth() === max.getUTCMonth()
@@ -123,13 +137,11 @@ function confidenceBand(minDate) {
 }
 
 /* =========================
-   EDD CACHE (DAILY)
+   EDD CACHE
 ========================= */
 const eddCache = new Map();
-
-function cacheKey(pin) {
-  return `${pin}-${new Date().toISOString().slice(0, 10)}`;
-}
+const cacheKey = (pin) =>
+  `${pin}-${new Date().toISOString().slice(0, 10)}`;
 
 /* =========================
    EDD SOURCES
@@ -144,7 +156,7 @@ async function getBluedartEDD(pin) {
         pPinCodeTo: pin,
         pProductCode: "A",
         pSubProductCode: "P",
-        pPudate: `/Date(${getIndiaDate().getTime()})/`,
+        pPudate: `/Date(${Date.now()})/`,
         pPickupTime: "16:00",
         profile: { Api_type: "S", LicenceKey: LICENCE_KEY_EDD, LoginID: LOGIN_ID },
       },
@@ -168,7 +180,7 @@ async function getShiprocketEDD(pin) {
     );
 
     const etd = res.data?.data?.available_courier_companies?.[0]?.etd;
-    return etd ? etd.split("T")[0] : null;
+    return etd || null;
   } catch {
     return null;
   }
@@ -186,31 +198,29 @@ app.post("/edd", async (req, res) => {
   const key = cacheKey(pincode);
   if (eddCache.has(key)) return res.json(eddCache.get(key));
 
-  // 🔒 RULE: Blue Dart first, Shiprocket only if BD fails
   let rawEDD = await getBluedartEDD(pincode);
-  if (!rawEDD) rawEDD = await getShiprocketEDD(pincode);
+  let minDate = parseBlueDartDate(rawEDD);
 
-  if (!rawEDD) {
+  if (!minDate) {
+    rawEDD = await getShiprocketEDD(pincode);
+    minDate = isValidDate(new Date(rawEDD)) ? new Date(rawEDD) : null;
+  }
+
+  if (!minDate) {
     return res.json({
       edd_display: null,
       message: "Delivery timeline will be confirmed after order placement",
     });
   }
 
-  const min = parseBDDate(rawEDD) || new Date(rawEDD);
   const response = {
-    edd_display: confidenceBand(min),
+    edd_display: confidenceBand(minDate),
     cached: false,
   };
 
   eddCache.set(key, { ...response, cached: true });
   res.json(response);
 });
-
-/* =========================
-   TRACKING (UNCHANGED)
-========================= */
-// (Your existing Blue Dart + Shiprocket tracking stays as-is)
 
 /* =========================
    HEALTH
