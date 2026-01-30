@@ -1,48 +1,44 @@
 import express from "express";
 import axios from "axios";
+import crypto from "crypto";
+import xml2js from "xml2js";
 import pg from "pg";
 
+/* ======================================================
+   APP
+====================================================== */
 const app = express();
 app.use(express.json());
 
-/* ===============================
-   🌍 CORS
-================================ */
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") return res.sendStatus(200);
-  next();
-});
-
-/* ===============================
-   🔑 ENV
-================================ */
+/* ======================================================
+   ENV
+====================================================== */
 const {
   DATABASE_URL,
   SHIPROCKET_EMAIL,
   SHIPROCKET_PASSWORD,
-  BLUEDART_TRACK_URL
+  SHOPIFY_WEBHOOK_SECRET
 } = process.env;
 
-/* ===============================
-   🗄️ DB
-================================ */
+const BLUEDART_TRACK_URL = "https://bluedart-edd.onrender.com/bluedart-track";
+
+/* ======================================================
+   DB
+====================================================== */
 const { Pool } = pg;
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-/* ===============================
-   🚚 SHIPROCKET AUTH
-================================ */
+/* ======================================================
+   SHIPROCKET TOKEN (EMAIL + PASSWORD FLOW)
+====================================================== */
 let shiprocketToken = null;
-let shiprocketTokenAt = 0;
+let shiprocketTokenExpiry = 0;
 
 async function getShiprocketToken() {
-  if (shiprocketToken && Date.now() - shiprocketTokenAt < 20 * 60 * 1000) {
+  if (shiprocketToken && Date.now() < shiprocketTokenExpiry) {
     return shiprocketToken;
   }
 
@@ -55,173 +51,125 @@ async function getShiprocketToken() {
   );
 
   shiprocketToken = res.data.token;
-  shiprocketTokenAt = Date.now();
+  shiprocketTokenExpiry = Date.now() + 23 * 60 * 60 * 1000;
+
   console.log("🔐 Shiprocket token refreshed");
   return shiprocketToken;
 }
 
-/* ===============================
-   🚚 TRACK — BLUEDART
-================================ */
+/* ======================================================
+   BLUEDART TRACKING (XML – RESTORED)
+====================================================== */
 async function trackBluedart(awb) {
-  const res = await axios.get(`${BLUEDART_TRACK_URL}?awb=${awb}`);
-  const scans = res.data?.Scans || [];
+  const res = await axios.get(`${BLUEDART_TRACK_URL}?awb=${awb}`, {
+    timeout: 15000
+  });
 
-  const last =
-    scans.find(s => s.Scan?.toUpperCase().includes("DELIVERED")) ||
-    scans[0] ||
-    {};
+  const parsed = await xml2js.parseStringPromise(res.data, {
+    explicitArray: false,
+    ignoreAttrs: true
+  });
+
+  const shipment = parsed?.ShipmentData?.Shipment;
+  if (!shipment) throw new Error("bluedart_no_data");
+
+  let scans = shipment?.Scans?.Scan || [];
+  if (!Array.isArray(scans)) scans = [scans];
+
+  const deliveredScan = scans.find(s =>
+    s?.Scan?.toUpperCase().includes("DELIVERED")
+  );
+
+  const lastScan = deliveredScan || scans[0];
 
   return {
     source: "bluedart",
     actual_courier: "Blue Dart",
-    status: last.Scan || null,
-    delivered: last.Scan?.toUpperCase().includes("DELIVERED"),
+    status: lastScan?.Scan || null,
+    delivered: Boolean(deliveredScan),
     raw: scans
   };
 }
 
-/* ===============================
-   🚚 TRACK — SHIPROCKET
-================================ */
+/* ======================================================
+   SHIPROCKET TRACKING (JSON)
+====================================================== */
 async function trackShiprocket(awb) {
   const token = await getShiprocketToken();
 
   const res = await axios.get(
     `https://apiv2.shiprocket.in/v1/external/courier/track/awb/${awb}`,
     {
-      headers: { Authorization: `Bearer ${token}` }
+      headers: {
+        Authorization: `Bearer ${token}`
+      }
     }
   );
 
-  const td = res.data.tracking_data;
-  const scans = td?.shipment_track_activities || [];
-  const info = td?.shipment_track?.[0] || {};
+  const activities = res.data?.tracking_data?.shipment_track_activities || [];
+  const latest = activities[0];
 
   return {
     source: "shiprocket",
-    actual_courier: info.courier_name || null,
-    status: info.current_status || null,
-    delivered: info.current_status === "Delivered",
-    raw: scans
+    actual_courier:
+      res.data?.tracking_data?.shipment_track?.courier_name || null,
+    status: latest?.activity || null,
+    delivered: latest?.sr_status_label === "DELIVERED",
+    raw: activities
   };
 }
 
-/* ===============================
-   🧠 PERSIST (UPDATE ONLY)
-================================ */
-async function persistTracking(awb, data) {
-  const { rows } = await pool.query(
-    `SELECT id FROM shipments WHERE awb = $1`,
-    [awb]
-  );
-
-  if (rows.length === 0) {
-    console.warn("⚠️ UNKNOWN AWB TRACK ATTEMPT:", awb);
-    return false;
-  }
-
-  await pool.query(
-    `
-    UPDATE shipments
-    SET
-      tracking_source = $2,
-      actual_courier = $3,
-      last_known_status = $4,
-      delivered_at = CASE
-        WHEN $5 = true THEN NOW()
-        ELSE delivered_at
-      END,
-      next_check_at = CASE
-        WHEN $5 = true THEN '9999-01-01'
-        ELSE NOW() + INTERVAL '12 hours'
-      END,
-      updated_at = NOW()
-    WHERE awb = $1
-    `,
-    [
-      awb,
-      data.source,
-      data.actual_courier,
-      data.status,
-      data.delivered
-    ]
-  );
-
-  return true;
-}
-
-/* ===============================
-   📦 PUBLIC TRACK API
-================================ */
+/* ======================================================
+   TRACK ROUTE (SHOPIFY-SAFE)
+====================================================== */
 app.get("/track", async (req, res) => {
   const { awb } = req.query;
   if (!awb) return res.status(400).json({ error: "awb_required" });
 
-  const { rows } = await pool.query(
-    `SELECT tracking_source FROM shipments WHERE awb = $1`,
-    [awb]
-  );
-
-  if (rows.length === 0) {
-    return res.status(404).json({ error: "not_found" });
-  }
-
-  const source = rows[0].tracking_source;
-  let data;
-
   try {
-    data =
-      source === "shiprocket"
-        ? await trackShiprocket(awb)
-        : await trackBluedart(awb);
-  } catch (e) {
-    console.error("❌ Tracking failed:", e.response?.data || e.message);
-    return res.status(500).json({ error: "tracking_failed" });
-  }
+    // 🔒 ONLY TRACK AWBs THAT EXIST IN SHOPIFY-LINKED SHIPMENTS
+    const { rows } = await pool.query(
+      `SELECT tracking_source FROM shipments WHERE awb = $1`,
+      [awb]
+    );
 
-  await persistTracking(awb, data);
-  res.json(data);
-});
-
-/* ===============================
-   ⏰ CRON — SAFE MODE
-================================ */
-app.post("/_cron/track/run", async (_, res) => {
-  const { rows } = await pool.query(
-    `
-    SELECT awb, tracking_source
-    FROM shipments
-    WHERE next_check_at <= NOW()
-      AND delivered_at IS NULL
-    LIMIT 50
-    `
-  );
-
-  let processed = 0;
-
-  for (const r of rows) {
-    try {
-      const data =
-        r.tracking_source === "shiprocket"
-          ? await trackShiprocket(r.awb)
-          : await trackBluedart(r.awb);
-
-      await persistTracking(r.awb, data);
-      processed++;
-    } catch (e) {
-      console.error("cron error:", r.awb);
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "not_found" });
     }
-  }
 
-  res.json({ ok: true, processed });
+    const source = rows[0].tracking_source;
+
+    let result;
+    if (source === "bluedart") {
+      result = await trackBluedart(awb);
+    } else if (source === "shiprocket") {
+      result = await trackShiprocket(awb);
+    } else {
+      return res.status(400).json({ error: "unknown_tracking_source" });
+    }
+
+    res.json(result);
+  } catch (err) {
+    console.error("tracking error:", err.message);
+    res.status(500).json({ error: "tracking_failed" });
+  }
 });
 
-/* ===============================
-   ❤️ HEALTH
-================================ */
+/* ======================================================
+   CRON (SAFE – NO INSERTS)
+====================================================== */
+app.post("/_cron/track/run", async (_req, res) => {
+  res.json({ ok: true, processed: 0 });
+});
+
+/* ======================================================
+   HEALTH
+====================================================== */
 app.get("/health", (_, res) => res.send("OK"));
 
+/* ======================================================
+   START
+====================================================== */
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () =>
   console.log("🚀 Ops Logistics running on", PORT)
