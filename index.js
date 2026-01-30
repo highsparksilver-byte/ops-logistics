@@ -29,8 +29,6 @@ app.use((req, res, next) => {
 /* ===============================
    🔑 ENV
 ================================ */
-const CLIENT_ID = process.env.CLIENT_ID;
-const CLIENT_SECRET = process.env.CLIENT_SECRET;
 const LOGIN_ID = process.env.LOGIN_ID;
 const LICENCE_KEY_TRACK = process.env.BD_LICENCE_KEY_TRACK;
 const SR_EMAIL = process.env.SHIPROCKET_EMAIL;
@@ -39,7 +37,7 @@ const SR_PASSWORD = process.env.SHIPROCKET_PASSWORD;
 console.log("🚀 Ops Logistics running");
 
 /* ===============================
-   🔐 JWT CACHE
+   🔐 SHIPROCKET TOKEN
 ================================ */
 let srJwt = null;
 let srJwtAt = 0;
@@ -56,14 +54,10 @@ async function getShiprocketJwt() {
 }
 
 /* ===============================
-   🧠 SLA + OPS LOGIC (STEP 10.1)
+   🧠 STATUS + SLA LOGIC
 ================================ */
-function hoursBetween(a, b) {
-  return Math.abs(a.getTime() - b.getTime()) / 36e5;
-}
-
 function classifyStatus(raw = "") {
-  const s = raw.toUpperCase();
+  const s = String(raw).toUpperCase();
   if (s.includes("DELIVERED")) return "DELIVERED";
   if (s.includes("OUT FOR DELIVERY")) return "OFD";
   if (s.includes("NDR") || s.includes("FAILED") || s.includes("ATTEMPT"))
@@ -72,7 +66,11 @@ function classifyStatus(raw = "") {
   return "NO_INFO";
 }
 
-function computeNextCheck(statusType, firstNdrAt = null) {
+function hoursBetween(a, b) {
+  return Math.abs(a.getTime() - b.getTime()) / 36e5;
+}
+
+function computeNextCheck(statusType, firstNdrAt) {
   const now = new Date();
 
   if (statusType === "DELIVERED") {
@@ -87,8 +85,8 @@ function computeNextCheck(statusType, firstNdrAt = null) {
     if (!firstNdrAt) {
       return new Date(now.getTime() + 6 * 60 * 60 * 1000);
     }
-    const hours = hoursBetween(now, new Date(firstNdrAt));
-    if (hours <= 14) {
+    const hrs = hoursBetween(now, firstNdrAt);
+    if (hrs <= 14) {
       return new Date(now.getTime() + 6 * 60 * 60 * 1000);
     }
     return new Date(now.getTime() + 2 * 60 * 60 * 1000);
@@ -145,21 +143,21 @@ async function trackShiprocket(awb) {
 }
 
 /* ===============================
-   💾 PERSIST (UPDATE ONLY)
+   💾 DB UPDATE (SAFE)
 ================================ */
 async function persistTracking(awb, data) {
   const statusType = classifyStatus(data.status);
   const now = new Date();
 
-  const row = await pool.query(
+  const { rows } = await pool.query(
     "SELECT first_ndr_at FROM shipments WHERE awb=$1",
     [awb]
   );
 
-  let firstNdrAt =
-    statusType === "NDR"
-      ? row.rows[0]?.first_ndr_at || now
-      : row.rows[0]?.first_ndr_at || null;
+  const existingFirstNdr = rows[0]?.first_ndr_at || null;
+
+  const firstNdrAt =
+    statusType === "NDR" && !existingFirstNdr ? now : existingFirstNdr;
 
   const nextCheck = computeNextCheck(statusType, firstNdrAt);
 
