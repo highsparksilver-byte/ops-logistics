@@ -1,16 +1,16 @@
 import express from "express";
-import axios from "axios";
 import crypto from "crypto";
+import axios from "axios";
 import pg from "pg";
 
 const { Pool } = pg;
 
 /* =================================================
-   🗄️ DATABASE
+   🗄️ DATABASE (NEON)
 ================================================= */
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
 });
 
 /* =================================================
@@ -31,13 +31,14 @@ app.use((req, res, next) => {
 });
 
 /* =================================================
-   🔑 SHOPIFY CONFIG
+   🔑 ENV
 ================================================= */
 const {
   SHOPIFY_CLIENT_ID,
   SHOPIFY_CLIENT_SECRET,
   SHOPIFY_API_VERSION,
-  SHOPIFY_SHOP
+  SHOPIFY_SHOP,
+  SHOPIFY_ACCESS_TOKEN,
 } = process.env;
 
 /* =================================================
@@ -46,37 +47,21 @@ const {
 app.get("/health", (_, res) => res.send("OK"));
 
 /* =================================================
-   🔐 SHOPIFY ORDER SYNC (ALL ORDERS)
+   🛒 PHASE 8.2 — SYNC ALL ORDERS
 ================================================= */
-app.post("/_cron/shopify/sync-orders", async (req, res) => {
+app.post("/_cron/shopify/sync-orders", async (_, res) => {
   try {
-    console.log("🛒 Shopify full order sync started");
-
-    const { rows } = await pool.query(
-      `SELECT access_token FROM shopify_shops WHERE shop_domain = $1`,
-      [SHOPIFY_SHOP]
-    );
-
-    if (!rows.length) {
-      return res.status(400).json({ error: "No shop installed" });
-    }
-
-    const token = rows[0].access_token;
-
     const url = `https://${SHOPIFY_SHOP}/admin/api/${SHOPIFY_API_VERSION}/orders.json?limit=250&status=any`;
 
-    const response = await axios.get(url, {
+    const r = await axios.get(url, {
       headers: {
-        "X-Shopify-Access-Token": token
-      }
+        "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
+      },
     });
 
-    const orders = response.data.orders || [];
-    console.log(`📦 Orders fetched: ${orders.length}`);
+    const orders = r.data.orders;
 
     for (const o of orders) {
-      const customer = o.customer || {};
-
       await pool.query(
         `
         INSERT INTO shopify_orders (
@@ -92,12 +77,7 @@ app.post("/_cron/shopify/sync-orders", async (req, res) => {
           updated_at
         )
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-        ON CONFLICT (shopify_order_id)
-        DO UPDATE SET
-          financial_status = EXCLUDED.financial_status,
-          fulfillment_status = EXCLUDED.fulfillment_status,
-          cancelled_at = EXCLUDED.cancelled_at,
-          updated_at = EXCLUDED.updated_at
+        ON CONFLICT (shopify_order_id) DO NOTHING
         `,
         [
           SHOPIFY_SHOP,
@@ -106,28 +86,90 @@ app.post("/_cron/shopify/sync-orders", async (req, res) => {
           o.financial_status,
           o.fulfillment_status,
           o.cancelled_at,
-          customer.email || null,
-          customer.phone || null,
+          o.email,
+          o.phone,
           o.created_at,
-          o.updated_at
+          o.updated_at,
         ]
       );
     }
 
-    console.log("✅ Shopify order sync complete");
     res.json({ ok: true, orders_fetched: orders.length });
-
   } catch (err) {
-    console.error("❌ Shopify sync failed");
-    console.error(err.response?.data || err.message);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
 /* =================================================
-   🚀 START SERVER
+   🚚 PHASE 8.3 — SYNC FULFILLMENTS → SHIPMENTS
+================================================= */
+app.post("/_cron/shopify/sync-fulfillments", async (_, res) => {
+  try {
+    console.log("🚚 Shopify fulfillment sync started");
+
+    const url = `https://${SHOPIFY_SHOP}/admin/api/${SHOPIFY_API_VERSION}/orders.json?limit=100&status=any&fields=id,name,email,phone,fulfillments`;
+
+    const r = await axios.get(url, {
+      headers: {
+        "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
+      },
+    });
+
+    let created = 0;
+
+    for (const order of r.data.orders) {
+      for (const f of order.fulfillments || []) {
+        const awb = f.tracking_number;
+        if (!awb) continue;
+
+        const exists = await pool.query(
+          `SELECT 1 FROM shipments WHERE awb = $1`,
+          [awb]
+        );
+
+        if (exists.rowCount > 0) continue;
+
+        await pool.query(
+          `
+          INSERT INTO shipments (
+            shopify_order_id,
+            shopify_order_name,
+            fulfillment_id,
+            awb,
+            courier,
+            customer_mobile,
+            customer_email,
+            next_check_at
+          )
+          VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+          `,
+          [
+            order.id,
+            order.name,
+            f.id,
+            awb,
+            f.tracking_company || "bluedart",
+            order.phone,
+            order.email,
+          ]
+        );
+
+        created++;
+        console.log("📦 Shipment created:", awb);
+      }
+    }
+
+    res.json({ ok: true, shipments_created: created });
+  } catch (err) {
+    console.error("❌ Fulfillment sync failed", err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/* =================================================
+   🚀 START
 ================================================= */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
-  console.log("🚀 Ops Logistics running on port", PORT)
+  console.log(`🚀 Ops Logistics running on port ${PORT}`)
 );
