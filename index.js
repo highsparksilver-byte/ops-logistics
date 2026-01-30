@@ -5,9 +5,9 @@ import xml2js from "xml2js";
 const app = express();
 app.use(express.json());
 
-/* =========================
-   CORS
-========================= */
+/* ===============================
+   🌍 CORS
+================================ */
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -16,11 +16,11 @@ app.use((req, res, next) => {
   next();
 });
 
-/* =========================
-   ENV
-========================= */
 const clean = (v) => v?.replace(/\r|\n|\t/g, "").trim();
 
+/* ===============================
+   🔑 ENV
+================================ */
 const CLIENT_ID = clean(process.env.CLIENT_ID);
 const CLIENT_SECRET = clean(process.env.CLIENT_SECRET);
 const LOGIN_ID = clean(process.env.LOGIN_ID);
@@ -33,11 +33,9 @@ const SR_PASSWORD = clean(process.env.SHIPROCKET_PASSWORD);
 
 console.log("🚀 Ops Logistics running");
 
-/* =========================
-   CONSTANTS
-========================= */
-const ORIGIN_PIN = "411022";
-
+/* ===============================
+   📅 CONSTANTS
+================================ */
 const HOLIDAYS = [
   "2026-01-26",
   "2026-03-03",
@@ -52,20 +50,18 @@ const METROS = [
   "KOLKATA","AHMEDABAD"
 ];
 
-/* =========================
-   JWT CACHE
-========================= */
-let bdJwt, bdJwtAt = 0;
-let srJwt, srJwtAt = 0;
+/* ===============================
+   🔐 JWT CACHE
+================================ */
+let bdJwt = null, bdJwtAt = 0;
+let srJwt = null, srJwtAt = 0;
 
 async function getBluedartJwt() {
   if (bdJwt && Date.now() - bdJwtAt < 23 * 60 * 60 * 1000) return bdJwt;
-
   const res = await axios.get(
     "https://apigateway.bluedart.com/in/transportation/token/v1/login",
     { headers: { Accept: "application/json", ClientID: CLIENT_ID, clientSecret: CLIENT_SECRET } }
   );
-
   bdJwt = res.data.JWTToken;
   bdJwtAt = Date.now();
   return bdJwt;
@@ -73,64 +69,76 @@ async function getBluedartJwt() {
 
 async function getShiprocketJwt() {
   if (!SR_EMAIL || !SR_PASSWORD) return null;
-  if (srJwt && Date.now() - srJwtAt < 7 * 24 * 60 * 60 * 1000) return srJwt;
-
+  if (srJwt && Date.now() - srJwtAt < 8 * 24 * 60 * 60 * 1000) return srJwt;
   const res = await axios.post(
     "https://apiv2.shiprocket.in/v1/external/auth/login",
     { email: SR_EMAIL, password: SR_PASSWORD }
   );
-
   srJwt = res.data.token;
   srJwtAt = Date.now();
   return srJwt;
 }
 
-/* =========================
-   DATE HELPERS (SAFE)
-========================= */
-function isValidDate(d) {
-  return d instanceof Date && !isNaN(d);
-}
-
-function parseBlueDartDate(str) {
-  if (!str || typeof str !== "string") return null;
-  const parts = str.split("-");
-  if (parts.length !== 3) return null;
-
-  const months = { Jan:0, Feb:1, Mar:2, Apr:3, May:4, Jun:5, Jul:6, Aug:7, Sep:8, Oct:9, Nov:10, Dec:11 };
-  const d = new Date(Date.UTC(Number(parts[2]), months[parts[1]], Number(parts[0])));
-  return isValidDate(d) ? d : null;
+/* ===============================
+   🕒 DATE HELPERS (SAFE)
+================================ */
+function getISTNow() {
+  const now = new Date();
+  return new Date(now.getTime() + (330 + now.getTimezoneOffset()) * 60000);
 }
 
 function isHoliday(d) {
-  if (!isValidDate(d)) return false;
+  if (!d || isNaN(d)) return false;
   const iso = d.toISOString().slice(0, 10);
   return d.getUTCDay() === 0 || HOLIDAYS.includes(iso);
 }
 
-function confidenceBand(minDate) {
-  if (!isValidDate(minDate)) return null;
-
-  let max = new Date(minDate);
-  max.setUTCDate(max.getUTCDate() + 1);
-  while (isHoliday(max)) max.setUTCDate(max.getUTCDate() + 1);
-
-  const fmt = (d) =>
-    `${d.getUTCDate()} ${["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][d.getUTCMonth()]}`;
-
-  return minDate.getUTCMonth() === max.getUTCMonth()
-    ? `${minDate.getUTCDate()}–${fmt(max)}`
-    : `${fmt(minDate)} – ${fmt(max)}`;
+function parseBlueDartDate(str) {
+  if (!str) return null;
+  const [dd, mon, yyyy] = str.split("-");
+  const months = { Jan:0, Feb:1, Mar:2, Apr:3, May:4, Jun:5, Jul:6, Aug:7, Sep:8, Oct:9, Nov:10, Dec:11 };
+  if (!months[mon]) return null;
+  return new Date(Date.UTC(Number(yyyy), months[mon], Number(dd)));
 }
 
-/* =========================
-   BADGE LOGIC
-========================= */
-function getBadge(minDate, city) {
-  if (!isValidDate(minDate)) return "STANDARD";
+function confidenceBand(minDate) {
+  if (!minDate || isNaN(minDate)) return null;
 
-  const today = new Date();
-  const diffDays = Math.round((minDate - today) / (1000 * 60 * 60 * 24));
+  const start = new Date(minDate.getTime());
+  const end = new Date(minDate.getTime());
+
+  end.setUTCDate(end.getUTCDate() + 1);
+  while (isHoliday(end)) end.setUTCDate(end.getUTCDate() + 1);
+
+  const fmt = (d) => `${d.getUTCDate()} ${["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][d.getUTCMonth()]}`;
+
+  return start.getUTCMonth() === end.getUTCMonth()
+    ? `${start.getUTCDate()}–${fmt(end)}`
+    : `${fmt(start)} – ${fmt(end)}`;
+}
+
+/* ===============================
+   🏙️ CITY
+================================ */
+async function getCity(pincode) {
+  try {
+    const r = await axios.get(`https://api.postalpincode.in/pincode/${pincode}`, { timeout: 3000 });
+    return r.data?.[0]?.PostOffice?.[0]?.District || null;
+  } catch {
+    return null;
+  }
+}
+
+/* ===============================
+   🚀 BADGE LOGIC
+================================ */
+function getBadge(minDate, city) {
+  if (!minDate) return "STANDARD";
+
+  const diffDays = Math.round(
+    (new Date(minDate.getTime() + 5.5 * 3600000) - getISTNow()) / 86400000
+  );
+
   const isMetro = METROS.some(m => (city || "").toUpperCase().includes(m));
 
   if (isMetro && diffDays <= 2) return "METRO_EXPRESS";
@@ -138,97 +146,93 @@ function getBadge(minDate, city) {
   return "STANDARD";
 }
 
-/* =========================
-   CITY LOOKUP
-========================= */
-async function getCity(pin) {
-  try {
-    const res = await axios.get(`https://api.postalpincode.in/pincode/${pin}`, { timeout: 3000 });
-    if (res.data?.[0]?.Status === "Success") {
-      return res.data[0].PostOffice[0].District || res.data[0].PostOffice[0].Name;
-    }
-  } catch {}
-  return null;
-}
-
-/* =========================
-   EDD SOURCES
-========================= */
-async function getBluedartEDD(pin) {
+/* ===============================
+   📦 EDD FETCH
+================================ */
+async function getBluedartEDD(pincode) {
   try {
     const jwt = await getBluedartJwt();
-    const res = await axios.post(
+    const r = await axios.post(
       "https://apigateway.bluedart.com/in/transportation/transit/v1/GetDomesticTransitTimeForPinCodeandProduct",
       {
-        pPinCodeFrom: ORIGIN_PIN,
-        pPinCodeTo: pin,
+        pPinCodeFrom: "411022",
+        pPinCodeTo: pincode,
         pProductCode: "A",
         pSubProductCode: "P",
-        pPudate: `/Date(${Date.now()})/`,
+        pPudate: `/Date(${getISTNow().getTime()})/`,
         pPickupTime: "16:00",
-        profile: { Api_type: "S", LicenceKey: LICENCE_KEY_EDD, LoginID: LOGIN_ID },
+        profile: { Api_type: "S", LicenceKey: LICENCE_KEY_EDD, LoginID: LOGIN_ID }
       },
       { headers: { JWTToken: jwt } }
     );
-
-    return res.data?.GetDomesticTransitTimeForPinCodeandProductResult?.ExpectedDateDelivery || null;
+    return r.data?.GetDomesticTransitTimeForPinCodeandProductResult?.ExpectedDateDelivery || null;
   } catch {
     return null;
   }
 }
 
-async function getShiprocketEDD(pin) {
+async function getShiprocketEDD(pincode) {
   try {
     const token = await getShiprocketJwt();
     if (!token) return null;
-
-    const res = await axios.get(
-      `https://apiv2.shiprocket.in/v1/external/courier/serviceability/?pickup_postcode=${ORIGIN_PIN}&delivery_postcode=${pin}&weight=0.5`,
+    const r = await axios.get(
+      `https://apiv2.shiprocket.in/v1/external/courier/serviceability/?pickup_postcode=411022&delivery_postcode=${pincode}&cod=1&weight=0.5`,
       { headers: { Authorization: `Bearer ${token}` } }
     );
-
-    return res.data?.data?.available_courier_companies?.[0]?.etd || null;
+    const list = r.data?.data?.available_courier_companies || [];
+    return list[0]?.etd || null;
   } catch {
     return null;
   }
 }
 
-/* =========================
-   EDD ROUTE
-========================= */
+/* ===============================
+   🧠 CACHE
+================================ */
+const eddCache = new Map();
+
+/* ===============================
+   🛣️ ROUTE
+================================ */
 app.post("/edd", async (req, res) => {
   const { pincode } = req.body;
-  if (!/^\d{6}$/.test(pincode)) return res.json({ edd_display: null });
-
-  let raw = await getBluedartEDD(pincode);
-  let min = parseBlueDartDate(raw);
-
-  if (!min) {
-    raw = await getShiprocketEDD(pincode);
-    min = isValidDate(new Date(raw)) ? new Date(raw) : null;
+  if (!/^[0-9]{6}$/.test(pincode)) {
+    return res.json({ edd_display: null });
   }
 
-  if (!min) {
-    return res.json({
-      edd_display: null,
-      message: "Delivery timeline will be confirmed after order placement",
-    });
-  }
+  const today = getISTNow().toISOString().slice(0, 10);
+  const key = `${pincode}-${today}`;
+
+  if (eddCache.has(key)) return res.json(eddCache.get(key));
 
   const city = await getCity(pincode);
-  const badge = getBadge(min, city);
 
-  res.json({
-    edd_display: confidenceBand(min),
+  let raw = await getBluedartEDD(pincode);
+  let minDate = parseBlueDartDate(raw);
+
+  if (!minDate) {
+    const sr = await getShiprocketEDD(pincode);
+    if (sr) minDate = new Date(sr);
+  }
+
+  if (!minDate || isNaN(minDate)) {
+    return res.json({ edd_display: null });
+  }
+
+  const response = {
+    edd_display: confidenceBand(minDate),
     city,
-    badge,
-  });
+    badge: getBadge(minDate, city)
+  };
+
+  eddCache.set(key, response);
+  res.json(response);
 });
 
-/* =========================
-   HEALTH
-========================= */
+/* ===============================
+   ❤️ HEALTH
+================================ */
 app.get("/health", (_, res) => res.send("OK"));
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log("🚀 Server on", PORT));
