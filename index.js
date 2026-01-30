@@ -1,6 +1,21 @@
 import express from "express";
 import axios from "axios";
+import xml2js from "xml2js";
+import pg from "pg";
 
+const { Pool } = pg;
+
+/* ===============================
+   🗄️ DATABASE
+================================ */
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+/* ===============================
+   🚀 APP
+================================ */
 const app = express();
 app.use(express.json());
 
@@ -24,21 +39,17 @@ const CLIENT_ID = clean(process.env.CLIENT_ID);
 const CLIENT_SECRET = clean(process.env.CLIENT_SECRET);
 const LOGIN_ID = clean(process.env.LOGIN_ID);
 const LICENCE_KEY_EDD = clean(process.env.BD_LICENCE_KEY_EDD);
-
+const LICENCE_KEY_TRACK = clean(process.env.BD_LICENCE_KEY_TRACK);
 const SR_EMAIL = clean(process.env.SHIPROCKET_EMAIL);
 const SR_PASSWORD = clean(process.env.SHIPROCKET_PASSWORD);
 
-console.log("🚀 Ops Logistics EDD running");
+console.log("🚀 Ops Logistics running");
 
 /* ===============================
    📅 CONSTANTS
 ================================ */
 const HOLIDAYS = [
-  "2026-01-26",
-  "2026-03-03",
-  "2026-08-15",
-  "2026-10-02",
-  "2026-11-01",
+  "2026-01-26","2026-03-03","2026-08-15","2026-10-02","2026-11-01"
 ];
 
 const METROS = [
@@ -55,12 +66,10 @@ let srJwt = null, srJwtAt = 0;
 
 async function getBluedartJwt() {
   if (bdJwt && Date.now() - bdJwtAt < 23 * 60 * 60 * 1000) return bdJwt;
-
   const res = await axios.get(
     "https://apigateway.bluedart.com/in/transportation/token/v1/login",
     { headers: { Accept: "application/json", ClientID: CLIENT_ID, clientSecret: CLIENT_SECRET } }
   );
-
   bdJwt = res.data.JWTToken;
   bdJwtAt = Date.now();
   return bdJwt;
@@ -69,12 +78,10 @@ async function getBluedartJwt() {
 async function getShiprocketJwt() {
   if (!SR_EMAIL || !SR_PASSWORD) return null;
   if (srJwt && Date.now() - srJwtAt < 8 * 24 * 60 * 60 * 1000) return srJwt;
-
   const res = await axios.post(
     "https://apiv2.shiprocket.in/v1/external/auth/login",
     { email: SR_EMAIL, password: SR_PASSWORD }
   );
-
   srJwt = res.data.token;
   srJwtAt = Date.now();
   return srJwt;
@@ -96,45 +103,38 @@ function isHoliday(d) {
 
 function getNextWorkingDate() {
   let d = getISTNow();
-  while (isHoliday(d)) {
-    d.setDate(d.getDate() + 1);
-  }
+  while (isHoliday(d)) d.setDate(d.getDate() + 1);
   return d;
 }
 
+/* ===============================
+   📦 EDD HELPERS
+================================ */
 function parseBlueDartDate(str) {
   if (!str) return null;
   const [dd, mon, yyyy] = str.split("-");
   const months = { Jan:0, Feb:1, Mar:2, Apr:3, May:4, Jun:5, Jul:6, Aug:7, Sep:8, Oct:9, Nov:10, Dec:11 };
-  if (!months[mon]) return null;
+  if (months[mon] === undefined) return null;
   return new Date(Date.UTC(Number(yyyy), months[mon], Number(dd)));
 }
 
-/* ===============================
-   ✅ CONFIDENCE BAND (FIXED)
-================================ */
 function confidenceBand(minDate) {
   if (!(minDate instanceof Date) || isNaN(minDate)) return null;
 
   const now = getISTNow();
-  const day = now.getDay();   // IST weekday
-  const hour = now.getHours(); // IST hour
+  const day = now.getDay();
+  const hour = now.getHours();
 
   let addDays = 1;
-
-  if ((day === 6 && hour >= 11) || day === 0) {
-    addDays = 2;
-  }
+  if ((day === 6 && hour >= 11) || day === 0) addDays = 2;
 
   const start = new Date(minDate);
   const end = new Date(minDate);
   end.setUTCDate(end.getUTCDate() + addDays);
 
-  while (isHoliday(end)) {
-    end.setUTCDate(end.getUTCDate() + 1);
-  }
+  while (isHoliday(end)) end.setUTCDate(end.getUTCDate() + 1);
 
-  const fmt = (d) =>
+  const fmt = d =>
     `${d.getUTCDate()} ${["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][d.getUTCMonth()]}`;
 
   return start.getUTCMonth() === end.getUTCMonth()
@@ -142,8 +142,17 @@ function confidenceBand(minDate) {
     : `${fmt(start)} – ${fmt(end)}`;
 }
 
+function getBadge(minDate, city) {
+  if (!minDate) return "STANDARD";
+  const diffDays = Math.max(0, Math.round((minDate - getISTNow()) / 86400000));
+  const isMetro = METROS.some(m => (city || "").toUpperCase().includes(m));
+  if (isMetro && diffDays <= 2) return "METRO_EXPRESS";
+  if (diffDays <= 3) return "EXPRESS";
+  return "STANDARD";
+}
+
 /* ===============================
-   🏙️ CITY & BADGE
+   🏙️ CITY LOOKUP
 ================================ */
 async function getCity(pincode) {
   try {
@@ -154,21 +163,8 @@ async function getCity(pincode) {
   }
 }
 
-function getBadge(minDate, city) {
-  if (!minDate) return "STANDARD";
-  const diffDays = Math.max(
-    0,
-    Math.round((minDate.getTime() - getISTNow().getTime()) / 86400000)
-  );
-  const isMetro = METROS.some(m => (city || "").toUpperCase().includes(m));
-
-  if (isMetro && diffDays <= 2) return "METRO_EXPRESS";
-  if (diffDays <= 3) return "EXPRESS";
-  return "STANDARD";
-}
-
 /* ===============================
-   📦 API FETCH
+   📦 EDD FETCH (BLUEDART → SHIPROCKET)
 ================================ */
 async function getBluedartEDD(pincode) {
   try {
@@ -186,7 +182,6 @@ async function getBluedartEDD(pincode) {
       },
       { headers: { JWTToken: jwt } }
     );
-
     return r.data?.GetDomesticTransitTimeForPinCodeandProductResult?.ExpectedDateDelivery || null;
   } catch {
     return null;
@@ -197,12 +192,10 @@ async function getShiprocketEDD(pincode) {
   try {
     const token = await getShiprocketJwt();
     if (!token) return null;
-
     const r = await axios.get(
       `https://apiv2.shiprocket.in/v1/external/courier/serviceability/?pickup_postcode=411022&delivery_postcode=${pincode}&cod=1&weight=0.5`,
       { headers: { Authorization: `Bearer ${token}` } }
     );
-
     return r.data?.data?.available_courier_companies?.[0]?.etd || null;
   } catch {
     return null;
@@ -210,7 +203,7 @@ async function getShiprocketEDD(pincode) {
 }
 
 /* ===============================
-   🛣️ ROUTE
+   🛣️ EDD ROUTE
 ================================ */
 const eddCache = new Map();
 
@@ -219,7 +212,7 @@ app.post("/edd", async (req, res) => {
   if (!/^[0-9]{6}$/.test(pincode)) return res.json({ edd_display: null });
 
   const now = getISTNow();
-  const key = `${pincode}-${now.toISOString().slice(0, 10)}-${now.getHours() >= 11 ? "PM" : "AM"}`;
+  const key = `${pincode}-${now.toISOString().slice(0,10)}-${now.getHours() >= 11 ? "PM" : "AM"}`;
 
   if (eddCache.has(key)) return res.json(eddCache.get(key));
 
@@ -240,7 +233,7 @@ app.post("/edd", async (req, res) => {
   const response = {
     edd_display: confidenceBand(minDate),
     city,
-    badge: getBadge(minDate, city),
+    badge: getBadge(minDate, city)
   };
 
   eddCache.set(key, response);
@@ -253,4 +246,4 @@ app.post("/edd", async (req, res) => {
 app.get("/health", (_, res) => res.send("OK"));
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log("🚀 Server on", PORT));
+app.listen(PORT, () => console.log("🚀 Server running on", PORT));
