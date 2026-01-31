@@ -1,13 +1,18 @@
 import express from "express";
 import axios from "axios";
 import xml2js from "xml2js";
+import crypto from "crypto";
 import pg from "pg";
 
 /* ===============================
    🚀 APP INIT
 ================================ */
 const app = express();
-app.use(express.json());
+app.use(express.json({ verify: rawBodySaver }));
+
+function rawBodySaver(req, res, buf) {
+  req.rawBody = buf;
+}
 
 /* ===============================
    🌍 CORS
@@ -21,7 +26,7 @@ app.use((req, res, next) => {
 });
 
 /* ===============================
-   🔑 ENV HELPERS
+   🔑 ENV
 ================================ */
 const clean = v => v?.replace(/\r|\n|\t/g, "").trim();
 
@@ -33,11 +38,12 @@ const {
   BD_LICENCE_KEY_EDD,
   BD_LICENCE_KEY_TRACK,
   SHIPROCKET_EMAIL,
-  SHIPROCKET_PASSWORD
+  SHIPROCKET_PASSWORD,
+  SHOPIFY_WEBHOOK_SECRET
 } = process.env;
 
 /* ===============================
-   🗄️ DB (unused in Phase 1.5 but kept safe)
+   🗄️ DB
 ================================ */
 const { Pool } = pg;
 const pool = new Pool({
@@ -46,7 +52,36 @@ const pool = new Pool({
 });
 
 /* ===============================
-   🕒 DATE HELPERS (IST SAFE)
+   🧱 DB SCHEMA (SAFE)
+================================ */
+async function bootstrapDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS orders_ops (
+      shopify_order_id TEXT PRIMARY KEY,
+      order_name TEXT,
+      payment_type TEXT,
+      order_total NUMERIC,
+      financial_status TEXT,
+      created_at TIMESTAMP DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS shipments (
+      awb TEXT PRIMARY KEY,
+      shopify_order_id TEXT,
+      platform TEXT,
+      actual_courier TEXT,
+      last_known_status TEXT,
+      delivered_at TIMESTAMP,
+      next_check_at TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT now()
+    );
+  `);
+  console.log("✅ DB schema ready");
+}
+bootstrapDB();
+
+/* ===============================
+   🕒 IST TIME
 ================================ */
 function nowIST() {
   const d = new Date();
@@ -64,8 +99,7 @@ const METROS = [
 
 function badgeFor(city) {
   if (!city) return "STANDARD";
-  const c = city.toUpperCase();
-  return METROS.some(m => c.includes(m))
+  return METROS.some(m => city.toUpperCase().includes(m))
     ? "METRO_EXPRESS"
     : "EXPRESS";
 }
@@ -99,33 +133,16 @@ async function getShiprocketJwt() {
 }
 
 /* ===============================
-   📅 EDD CORE LOGIC (PATCHED)
+   📅 EDD CORE
 ================================ */
-/**
- * RULES IMPLEMENTED:
- * - Fastest date NEVER changes
- * - Buffer applies ONLY to end date
- * - No +1 after 6pm logic
- * - Metro affects badge only
- */
 function confidenceBand(fastestDate) {
   if (!fastestDate) return null;
-
   const start = new Date(fastestDate);
   const end = new Date(start);
-
-  // widen ONLY the end
   end.setDate(end.getDate() + 1);
 
   const fmt = d =>
     `${String(d.getDate()).padStart(2,"0")}-${["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"][d.getMonth()]}-${String(d.getFullYear()).slice(-2)}`;
-
-  if (
-    start.getDate() === end.getDate() &&
-    start.getMonth() === end.getMonth()
-  ) {
-    return fmt(start);
-  }
 
   return `${fmt(start)}–${fmt(end)}`;
 }
@@ -189,9 +206,9 @@ app.post("/edd", async (req, res) => {
     return res.json({ edd_display: null });
 
   const city = await getCity(pincode);
-
   let fastest = await getBluedartEDD(pincode);
   if (!fastest) fastest = await getShiprocketEDD(pincode);
+
   if (!fastest) return res.json({ edd_display: null });
 
   res.json({
@@ -202,7 +219,7 @@ app.post("/edd", async (req, res) => {
 });
 
 /* ===============================
-   🚚 TRACKING (FROZEN GOLD)
+   🚚 TRACKING (UNCHANGED)
 ================================ */
 function normalizeStatus(v) {
   if (!v) return "IN TRANSIT";
@@ -268,6 +285,57 @@ app.get("/track", async (req, res) => {
 });
 
 /* ===============================
+   🛍️ SHOPIFY WEBHOOKS (READ ONLY)
+================================ */
+function verifyShopify(req) {
+  const hmac = req.headers["x-shopify-hmac-sha256"];
+  const digest = crypto
+    .createHmac("sha256", SHOPIFY_WEBHOOK_SECRET)
+    .update(req.rawBody, "utf8")
+    .digest("base64");
+  return digest === hmac;
+}
+
+app.post("/webhooks/orders_paid", async (req, res) => {
+  if (!verifyShopify(req)) return res.sendStatus(401);
+  const o = req.body;
+
+  await pool.query(
+    `
+    INSERT INTO orders_ops
+      (shopify_order_id, order_name, payment_type, order_total, financial_status)
+    VALUES ($1,$2,$3,$4,$5)
+    ON CONFLICT (shopify_order_id) DO NOTHING
+    `,
+    [
+      o.id,
+      o.name,
+      o.gateway === "cod" ? "COD" : "PREPAID",
+      o.total_price,
+      o.financial_status
+    ]
+  );
+  res.sendStatus(200);
+});
+
+app.post("/webhooks/fulfillment_create", async (req, res) => {
+  if (!verifyShopify(req)) return res.sendStatus(401);
+  const f = req.body;
+  const awb = f.tracking_numbers?.[0];
+  if (!awb) return res.sendStatus(200);
+
+  await pool.query(
+    `
+    INSERT INTO shipments (awb, shopify_order_id, platform)
+    VALUES ($1,$2,$3)
+    ON CONFLICT (awb) DO NOTHING
+    `,
+    [awb, f.order_id, "shopify"]
+  );
+  res.sendStatus(200);
+});
+
+/* ===============================
    ❤️ HEALTH
 ================================ */
 app.get("/health", (_, res) => res.send("OK"));
@@ -277,5 +345,5 @@ app.get("/health", (_, res) => res.send("OK"));
 ================================ */
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () =>
-  console.log("🚀 Ops Logistics running on", PORT)
+  console.log("🚀 Ops Logistics Phase 2 running on", PORT)
 );
