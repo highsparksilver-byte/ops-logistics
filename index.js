@@ -1,12 +1,21 @@
 import express from "express";
 import axios from "axios";
 import xml2js from "xml2js";
+import pg from "pg";
+import crypto from "crypto";
 
 /* ===============================
    🚀 APP INIT
 ================================ */
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+
+// ✅ FIX: Capture Raw Body for HMAC Verification
+app.use(express.json({ 
+  limit: "2mb",
+  verify: (req, res, buf) => {
+    req.rawBody = buf.toString();
+  }
+}));
 
 /* ===============================
    🌍 CORS
@@ -24,15 +33,26 @@ app.use((req, res, next) => {
 ================================ */
 const clean = v => v?.replace(/\r|\n|\t/g, "").trim();
 
-const CLIENT_ID = clean(process.env.CLIENT_ID);
-const CLIENT_SECRET = clean(process.env.CLIENT_SECRET);
-const LOGIN_ID = clean(process.env.LOGIN_ID);
+const {
+  CLIENT_ID,
+  CLIENT_SECRET,
+  LOGIN_ID,
+  BD_LICENCE_KEY_TRACK,
+  BD_LICENCE_KEY_EDD,
+  SHIPROCKET_EMAIL,
+  SHIPROCKET_PASSWORD,
+  DATABASE_URL,
+  SHOPIFY_WEBHOOK_SECRET
+} = process.env; // Simplified for safety
 
-const BD_LICENCE_KEY_TRACK = clean(process.env.BD_LICENCE_KEY_TRACK);
-const BD_LICENCE_KEY_EDD = clean(process.env.BD_LICENCE_KEY_EDD);
-
-const SHIPROCKET_EMAIL = clean(process.env.SHIPROCKET_EMAIL);
-const SHIPROCKET_PASSWORD = clean(process.env.SHIPROCKET_PASSWORD);
+/* ===============================
+   🗄️ DATABASE
+================================ */
+const { Pool } = pg;
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
 
 /* ===============================
    🕒 DATE HELPERS
@@ -51,30 +71,23 @@ function getNextWorkingDate() {
 /* ===============================
    🏙️ METRO BADGE
 ================================ */
-const METROS = [
-  "MUMBAI","DELHI","NEW DELHI","NOIDA","GURGAON","GURUGRAM",
-  "BANGALORE","BENGALURU","PUNE","CHENNAI","HYDERABAD",
-  "KOLKATA","AHMEDABAD"
-];
-
-function badgeFor(city) {
-  if (!city) return "EXPRESS";
-  return METROS.some(m => city.toUpperCase().includes(m))
+const METROS = ["MUMBAI","DELHI","BANGALORE","PUNE","CHENNAI","HYDERABAD","KOLKATA","AHMEDABAD"];
+const badgeFor = city =>
+  city && METROS.some(m => city.toUpperCase().includes(m))
     ? "METRO_EXPRESS"
     : "EXPRESS";
-}
 
 /* ===============================
    🔐 TOKEN CACHE
 ================================ */
-let bdJwt = null, bdJwtAt = 0;
-let srJwt = null, srJwtAt = 0;
+let bdJwt, bdJwtAt = 0;
+let srJwt, srJwtAt = 0;
 
 async function getBluedartJwt() {
-  if (bdJwt && Date.now() - bdJwtAt < 23 * 60 * 60 * 1000) return bdJwt;
+  if (bdJwt && Date.now() - bdJwtAt < 23*60*60*1000) return bdJwt;
   const r = await axios.get(
     "https://apigateway.bluedart.com/in/transportation/token/v1/login",
-    { headers: { ClientID: CLIENT_ID, clientSecret: CLIENT_SECRET } }
+    { headers: { ClientID: clean(CLIENT_ID), clientSecret: clean(CLIENT_SECRET) } }
   );
   bdJwt = r.data.JWTToken;
   bdJwtAt = Date.now();
@@ -82,10 +95,10 @@ async function getBluedartJwt() {
 }
 
 async function getShiprocketJwt() {
-  if (srJwt && Date.now() - srJwtAt < 7 * 24 * 60 * 60 * 1000) return srJwt;
+  if (srJwt && Date.now() - srJwtAt < 7*24*60*60*1000) return srJwt;
   const r = await axios.post(
     "https://apiv2.shiprocket.in/v1/external/auth/login",
-    { email: SHIPROCKET_EMAIL, password: SHIPROCKET_PASSWORD }
+    { email: clean(SHIPROCKET_EMAIL), password: clean(SHIPROCKET_PASSWORD) }
   );
   srJwt = r.data.token;
   srJwtAt = Date.now();
@@ -96,17 +109,10 @@ async function getShiprocketJwt() {
    📅 EDD
 ================================ */
 function confidenceBand(fastestDate) {
-  if (!fastestDate || isNaN(fastestDate.getTime())) return null;
-
-  const now = nowIST();
-  let addDays = 1;
-  if ((now.getDay() === 6 && now.getHours() >= 11) || now.getDay() === 0) {
-    addDays = 2;
-  }
-
+  if (!fastestDate || isNaN(fastestDate)) return null;
   const start = new Date(fastestDate);
   const end = new Date(start);
-  end.setDate(end.getDate() + addDays);
+  end.setDate(end.getDate() + 1);
 
   const fmt = d =>
     `${String(d.getDate()).padStart(2,"0")}-${["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"][d.getMonth()]}-${String(d.getFullYear()).slice(-2)}`;
@@ -133,7 +139,7 @@ async function getBluedartEDD(pin) {
         pSubProductCode: "P",
         pPudate: getNextWorkingDate(),
         pPickupTime: "16:00",
-        profile: { Api_type: "S", LicenceKey: BD_LICENCE_KEY_EDD, LoginID: LOGIN_ID }
+        profile: { Api_type: "S", LicenceKey: clean(BD_LICENCE_KEY_EDD), LoginID: clean(LOGIN_ID) }
       },
       { headers: { JWTToken: jwt } }
     );
@@ -157,9 +163,7 @@ app.post("/edd", async (req, res) => {
   if (!/^[0-9]{6}$/.test(pincode)) return res.json({ edd_display: null });
 
   const city = await getCity(pincode);
-  let fastest = await getBluedartEDD(pincode);
-  if (!fastest) fastest = await getShiprocketEDD(pincode);
-
+  let fastest = await getBluedartEDD(pincode) || await getShiprocketEDD(pincode);
   if (!fastest) return res.json({ edd_display: null });
 
   res.json({
@@ -170,51 +174,38 @@ app.post("/edd", async (req, res) => {
 });
 
 /* ===============================
-   🚚 TRACKING LOGIC (GOOGLE SCRIPT CLONE)
+   🚚 TRACKING (LEGACY + SMART LOOKUP)
 ================================ */
-function getStatusType(s = "") {
+function getStatusType(s="") {
   s = s.toUpperCase();
   if (s.includes("DELIVERED")) return "DL";
   if (s.includes("RTO") || s.includes("RETURN")) return "RT";
-  if (s.includes("UNDELIVERED") || s.includes("FAILURE")) return "NDR";
   if (s.includes("OUT FOR")) return "OF";
-  if (s.includes("PICK")) return "PU";
   return "UD";
-}
-
-function normalizeStatus(v) {
-  const s = (v || "").toUpperCase();
-  if (s.includes("DELIVERED")) return "DELIVERED";
-  if (s.includes("RTO")) return "RTO / RETURNED";
-  if (s.includes("OUT FOR")) return "OUT FOR DELIVERY";
-  return "IN TRANSIT";
 }
 
 async function trackBluedart(awb) {
   try {
-    // 🎯 MIMICKING GOOGLE SCRIPT EXACTLY (Legacy Endpoint + verno=1)
-    const url = `https://api.bluedart.com/servlet/RoutingServlet`;
-    const params = {
-      handler: 'tnt',
-      action: 'custawbquery',
-      loginid: LOGIN_ID,
-      awb: 'awb',
-      numbers: awb,
-      format: 'xml',
-      lickey: BD_LICENCE_KEY_TRACK,
-      verno: 1, // ✅ The missing piece from GAS
-      scan: 1
-    };
+    // Uses Google Script Logic (Legacy Servlet + verno=1)
+    const r = await axios.get("https://api.bluedart.com/servlet/RoutingServlet", {
+      params: {
+        handler: "tnt",
+        action: "custawbquery",
+        loginid: clean(LOGIN_ID),
+        awb: "awb",
+        numbers: awb,
+        format: "xml",
+        lickey: clean(BD_LICENCE_KEY_TRACK),
+        verno: 1,
+        scan: 1
+      },
+      responseType: "text"
+    });
 
-    const r = await axios.get(url, { params, responseType: "text", timeout: 8000 });
-    
-    // Check if response is HTML (Error)
-    if (r.data.includes("<html") || r.data.includes("<HTML")) return null;
-
-    const parsed = await xml2js.parseStringPromise(r.data, { explicitArray: false });
-    const s = parsed?.ShipmentData?.Shipment;
-
-    if (!s || !s.Status) return null;
+    if (r.data.includes("<html")) return null;
+    const p = await xml2js.parseStringPromise(r.data, { explicitArray:false });
+    const s = p?.ShipmentData?.Shipment;
+    if (!s) return null;
 
     return {
       source: "bluedart",
@@ -222,11 +213,13 @@ async function trackBluedart(awb) {
       status: s.Status,
       statusType: getStatusType(s.Status),
       statusDate: s.StatusDate,
-      statusTime: s.StatusTime, 
-      delivered: getStatusType(s.Status) === "DL",
-      raw: Array.isArray(s.Scans?.ScanDetail) ? s.Scans.ScanDetail : [s.Scans?.ScanDetail || null]
+      statusTime: s.StatusTime,
+      delivered: getStatusType(s.Status)==="DL",
+      raw: Array.isArray(s.Scans?.ScanDetail)
+        ? s.Scans.ScanDetail
+        : [s.Scans?.ScanDetail || null]
     };
-  } catch (e) { return null; }
+  } catch { return null; }
 }
 
 async function trackShiprocket(awb) {
@@ -234,84 +227,103 @@ async function trackShiprocket(awb) {
     const t = await getShiprocketJwt();
     const r = await axios.get(
       `https://apiv2.shiprocket.in/v1/external/courier/track/awb/${awb}`,
-      { headers: { Authorization: `Bearer ${t}` }, timeout: 8000 }
+      { headers: { Authorization: `Bearer ${t}` } }
     );
-
     const td = r.data?.tracking_data;
     if (!td) return null;
 
     const scan = td.shipment_track_activities?.[0] || {};
-    const parts = (scan.date || "").split(" ");
+    const [date,time] = (scan.date || "").split(" ");
 
     return {
       source: "shiprocket",
       actual_courier: td.courier_name || "Shiprocket",
-      status: normalizeStatus(td.current_status),
+      status: td.current_status,
       statusType: getStatusType(td.current_status),
-      statusDate: parts[0] || null,
-      statusTime: parts[1] || null,
-      delivered: getStatusType(td.current_status) === "DL",
+      statusDate: date || null,
+      statusTime: time || null,
+      delivered: getStatusType(td.current_status)==="DL",
       raw: td.shipment_track_activities || []
     };
   } catch { return null; }
 }
 
-app.get("/track", async (req, res) => {
+app.get("/track", async (req,res) => {
   const { awb } = req.query;
-  if (!awb) return res.status(400).json({ error: "awb_required" });
+  if (!awb) return res.status(400).json({ error:"awb_required" });
 
-  let data = await trackBluedart(awb);
-  if (!data) data = await trackShiprocket(awb);
+  // 1. Check DB for preferred courier
+  let courier = null;
+  try {
+      const { rows } = await pool.query("SELECT courier_source FROM shipments_ops WHERE awb=$1", [awb]);
+      courier = rows[0]?.courier_source;
+  } catch (e) { console.error("DB Read Error", e.message); }
 
-  if (!data) return res.status(404).json({ error: "not_found" });
+  let data = null;
+  
+  // 2. Route intelligently
+  if (courier === "bluedart") {
+    data = await trackBluedart(awb);
+  } else if (courier === "shiprocket") {
+    data = await trackShiprocket(awb);
+  } else {
+    // 3. Fallback: Try BD, then SR
+    data = await trackBluedart(awb) || await trackShiprocket(awb);
+  }
 
+  if (!data) return res.status(404).json({ error:"not_found" });
   res.json(data);
 });
 
-
 /* ===============================
-   🧾 OPS – PHASE 3A
+   🧾 PHASE 3B — FULFILLMENT WEBHOOK
 ================================ */
-const OPS_ORDERS = [];
+function verifyShopify(req) {
+  const secret = clean(process.env.SHOPIFY_WEBHOOK_SECRET);
+  if (!secret) return true;
+  
+  // ✅ FIX: Use req.rawBody for accurate HMAC
+  if (!req.rawBody) return false;
 
-/**
- * Shopify: Orders Paid Webhook
- */
-app.post("/webhooks/orders_paid", (req, res) => {
-  try {
-    const o = req.body || {};
+  const hmac = req.headers["x-shopify-hmac-sha256"];
+  const digest = crypto
+    .createHmac("sha256", secret)
+    .update(req.rawBody)
+    .digest("base64");
+  return hmac === digest;
+}
 
-    OPS_ORDERS.push({
-      order_id: o.id || null,
-      order_name: o.name || null,
-      financial_status: o.financial_status || null,
-      awb: null,
-      courier_source: "unknown",
-      created_at: new Date().toISOString()
-    });
-
-    return res.sendStatus(200);
-  } catch {
-    return res.sendStatus(200); // never fail Shopify
+app.post("/webhooks/fulfillments_create", async (req,res) => {
+  res.sendStatus(200);
+  
+  if (!verifyShopify(req)) {
+      console.error("❌ Invalid Webhook HMAC");
+      return;
   }
-});
 
-/**
- * Internal Ops View
- */
-app.get("/ops/orders", (_, res) => {
-  res.json({ count: OPS_ORDERS.length, orders: OPS_ORDERS });
+  const f = req.body;
+  const awb = f.tracking_number;
+  if (!awb) return;
+
+  const courier = f.tracking_company?.toLowerCase().includes("blue") ? "bluedart" : "shiprocket";
+
+  try {
+      await pool.query(
+        `INSERT INTO shipments_ops (order_id, awb, courier_source)
+         VALUES ($1,$2,$3)
+         ON CONFLICT (awb) DO NOTHING`,
+        [f.order_id, awb, courier]
+      );
+      console.log(`✅ Linked AWB ${awb} to ${courier}`);
+  } catch (e) {
+      console.error("DB Write Error:", e.message);
+  }
 });
 
 /* ===============================
    ❤️ HEALTH
 ================================ */
-app.get("/health", (_, res) => res.send("OK"));
+app.get("/health", (_,res)=>res.send("OK"));
 
-/* ===============================
-   🚀 START
-================================ */
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () =>
-  console.log("🚀 Ops Logistics running on", PORT)
-);
+app.listen(PORT, ()=>console.log("🚀 Ops Logistics running on",PORT));
