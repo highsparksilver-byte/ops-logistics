@@ -44,12 +44,12 @@ function nowIST() {
 
 function getNextWorkingDate() {
   const d = nowIST();
-  if (d.getDay() === 0) d.setDate(d.getDate() + 1); // skip Sunday
+  if (d.getDay() === 0) d.setDate(d.getDate() + 1); // Sunday → Monday
   return `/Date(${d.getTime()})/`;
 }
 
 /* ===============================
-   🏙️ METRO BADGE (DISPLAY ONLY)
+   🏙️ METRO BADGE (BADGE ONLY)
 ================================ */
 const METROS = [
   "MUMBAI","DELHI","NEW DELHI","NOIDA","GURGAON","GURUGRAM",
@@ -67,8 +67,8 @@ function badgeFor(city) {
 /* ===============================
    🔐 TOKEN CACHE
 ================================ */
-let bdJwt = null, bdJwtAt = 0;
-let srJwt = null, srJwtAt = 0;
+let bdJwt, bdJwtAt = 0;
+let srJwt, srJwtAt = 0;
 
 async function getBluedartJwt() {
   if (bdJwt && Date.now() - bdJwtAt < 23 * 60 * 60 * 1000) return bdJwt;
@@ -93,12 +93,11 @@ async function getShiprocketJwt() {
 }
 
 /* ===============================
-   📅 EDD LOGIC (YOUR RULES)
+   📅 EDD LOGIC (LOCKED)
 ================================ */
-function confidenceBand(fastestDate) {
-  if (!fastestDate || isNaN(fastestDate.getTime())) return null;
-
-  const start = new Date(fastestDate);
+function confidenceBand(fastest) {
+  if (!fastest || isNaN(fastest.getTime())) return null;
+  const start = new Date(fastest);
   const end = new Date(start);
   end.setDate(end.getDate() + 1); // buffer ONLY on end date
 
@@ -112,7 +111,9 @@ async function getCity(pin) {
   try {
     const r = await axios.get(`https://api.postalpincode.in/pincode/${pin}`);
     return r.data?.[0]?.PostOffice?.[0]?.District || null;
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }
 
 async function getBluedartEDD(pin) {
@@ -132,7 +133,9 @@ async function getBluedartEDD(pin) {
       { headers: { JWTToken: jwt } }
     );
     return r.data?.GetDomesticTransitTimeForPinCodeandProductResult?.ExpectedDateDelivery || null;
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }
 
 async function getShiprocketEDD(pin) {
@@ -143,7 +146,9 @@ async function getShiprocketEDD(pin) {
       { headers: { Authorization: `Bearer ${t}` } }
     );
     return r.data?.data?.available_courier_companies?.[0]?.etd || null;
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }
 
 app.post("/edd", async (req, res) => {
@@ -163,9 +168,9 @@ app.post("/edd", async (req, res) => {
 });
 
 /* ===============================
-   🚚 TRACKING (SOURCE SMART)
+   🚚 TRACKING (COURIER-AWARE)
 ================================ */
-function getStatusType(s = "") {
+function getStatusType(s="") {
   s = s.toUpperCase();
   if (s.includes("DELIVERED")) return "DL";
   if (s.includes("RTO") || s.includes("RETURN")) return "RT";
@@ -175,8 +180,8 @@ function getStatusType(s = "") {
   return "UD";
 }
 
-function normalizeStatus(v = "") {
-  const s = v.toUpperCase();
+function normalizeStatus(v) {
+  const s = (v || "").toUpperCase();
   if (s.includes("DELIVERED")) return "DELIVERED";
   if (s.includes("RTO")) return "RTO / RETURNED";
   if (s.includes("OUT FOR")) return "OUT FOR DELIVERY";
@@ -186,9 +191,9 @@ function normalizeStatus(v = "") {
 async function trackBluedart(awb) {
   try {
     const url =
-      `https://api.bluedart.com/servlet/RoutingServlet?handler=tnt&action=custawbquery` +
-      `&loginid=${LOGIN_ID}&awb=awb&numbers=${awb}` +
-      `&format=xml&lickey=${BD_LICENCE_KEY_TRACK}&scan=1`;
+      `https://api.bluedart.com/servlet/RoutingServlet` +
+      `?handler=tnt&action=custawbquery&loginid=${LOGIN_ID}` +
+      `&awb=awb&numbers=${awb}&format=xml&lickey=${BD_LICENCE_KEY_TRACK}&scan=1`;
 
     const r = await axios.get(url, { responseType: "text", timeout: 8000 });
     const parsed = await xml2js.parseStringPromise(r.data, { explicitArray: false });
@@ -198,14 +203,18 @@ async function trackBluedart(awb) {
     return {
       source: "bluedart",
       actual_courier: "Blue Dart",
-      status: s.Status,
+      status: normalizeStatus(s.Status),
       statusType: getStatusType(s.Status),
+      statusDate: s.StatusDate || null,
+      statusTime: s.StatusTime || null,
       delivered: getStatusType(s.Status) === "DL",
       raw: Array.isArray(s.Scans?.ScanDetail)
         ? s.Scans.ScanDetail
         : [s.Scans?.ScanDetail || null]
     };
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }
 
 async function trackShiprocket(awb) {
@@ -215,33 +224,44 @@ async function trackShiprocket(awb) {
       `https://apiv2.shiprocket.in/v1/external/courier/track/awb/${awb}`,
       { headers: { Authorization: `Bearer ${t}` }, timeout: 8000 }
     );
+
     const td = r.data?.tracking_data;
     if (!td) return null;
+
+    const scan = td.shipment_track_activities?.[0] || {};
+    const parts = (scan.date || "").split(" ");
 
     return {
       source: "shiprocket",
       actual_courier: td.courier_name || "Shiprocket",
       status: normalizeStatus(td.current_status),
       statusType: getStatusType(td.current_status),
+      statusDate: parts[0] || null,
+      statusTime: parts[1] || null,
       delivered: getStatusType(td.current_status) === "DL",
       raw: td.shipment_track_activities || []
     };
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }
 
-/* ===============================
-   🎯 TRACK ROUTER (FINAL RULE)
-================================ */
 app.get("/track", async (req, res) => {
   const { awb } = req.query;
   if (!awb) return res.status(400).json({ error: "awb_required" });
 
-  // 🔥 FINAL RULE:
-  // Unknown AWB → Blue Dart first, fallback once
-  let data = await trackBluedart(awb);
-  if (!data) data = await trackShiprocket(awb);
-  if (!data) return res.status(404).json({ error: "not_found" });
+  // heuristic: numeric 10–12 digit = Blue Dart
+  const looksBluedart = /^[0-9]{10,12}$/.test(awb);
 
+  let data = looksBluedart
+    ? await trackBluedart(awb)
+    : await trackShiprocket(awb);
+
+  // fallback ONLY if unknown
+  if (!data && !looksBluedart) data = await trackBluedart(awb);
+  if (!data && looksBluedart) data = await trackShiprocket(awb);
+
+  if (!data) return res.status(404).json({ error: "not_found" });
   res.json(data);
 });
 
