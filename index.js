@@ -278,21 +278,32 @@ app.post("/track/customer", async (req, res) => {
 /* ========================================================
    🤖 THE WATCHDOG WORKER (Used by Cron + Force Button)
 ======================================================== */
-async function runWatchdog(manual = false) {
+async function runWatchdog(manual = false, courierFilter = null) {
     let logs = [];
     try {
-        // Randomly pick 20 items that are missing status OR not delivered yet
-        const { rows } = await pool.query(`
+        // Construct Query: Randomly pick items that need updating
+        // If 'courierFilter' is passed (e.g., 'shiprocket'), ONLY pick those.
+        let query = `
             SELECT awb, courier_source 
             FROM shipments_ops 
-            WHERE delivered = false OR last_status IS NULL
-            ORDER BY RANDOM()
-            LIMIT 20
-        `);
+            WHERE (delivered = false OR last_status IS NULL)
+        `;
+        let values = [];
+
+        if (courierFilter) {
+            query += ` AND courier_source = $1`;
+            values.push(courierFilter);
+        }
+
+        // Limit batch size (20 default, 30 if specific filter to move faster)
+        const limit = courierFilter ? 30 : 20;
+        query += ` ORDER BY RANDOM() LIMIT ${limit}`;
+
+        const { rows } = await pool.query(query, values);
 
         if (rows.length === 0) return { count: 0, logs: ["✅ All orders up to date."] };
 
-        console.log(`🤖 Watchdog: Checking ${rows.length} orders...`);
+        console.log(`🤖 Watchdog: Checking ${rows.length} orders (${courierFilter || 'Mixed'})...`);
         
         for (const r of rows) {
             let t = null;
@@ -315,8 +326,8 @@ async function runWatchdog(manual = false) {
                 if (manual) logs.push(`No Data: ${r.awb} (${r.courier_source})`);
             }
             
-            // Sleep 2s
-            await new Promise(res => setTimeout(res, 2000));
+            // Sleep 1.5s (Faster than 2s to clear backlog)
+            await new Promise(res => setTimeout(res, 1500));
         }
     } catch (e) {
         console.error("🤖 Watchdog Error:", e.message);
@@ -330,9 +341,15 @@ cron.schedule('*/30 * * * *', async () => {
     await runWatchdog(false);
 });
 
-// 2. THE MANUAL FORCE BUTTON
+// 2. MIXED FORCE BUTTON
 app.get("/admin/force-update", async (req, res) => {
     const result = await runWatchdog(true);
+    res.json(result);
+});
+
+// 3. 🚀 SHIPROCKET ONLY BUTTON
+app.get("/admin/force-shiprocket", async (req, res) => {
+    const result = await runWatchdog(true, 'shiprocket');
     res.json(result);
 });
 
