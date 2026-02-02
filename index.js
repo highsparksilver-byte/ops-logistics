@@ -9,7 +9,8 @@ import crypto from "crypto";
 ================================ */
 const app = express();
 const rateLimiter = new Map();
-axios.defaults.timeout = 15000; // Extended for BlueDart
+// 🛡️ Global Timeout (extended for courier APIs)
+axios.defaults.timeout = 15000;
 
 setInterval(() => { rateLimiter.clear(); console.log("🧹 Rate limiter cleared"); }, 60 * 60 * 1000);
 
@@ -27,8 +28,11 @@ const clean = v => v?.replace(/\r|\n|\t/g, "").trim();
 const {
   CLIENT_ID, CLIENT_SECRET, LOGIN_ID, BD_LICENCE_KEY_TRACK, BD_LICENCE_KEY_EDD,
   SHIPROCKET_EMAIL, SHIPROCKET_PASSWORD, DATABASE_URL, SHOPIFY_WEBHOOK_SECRET,
-  SHOPIFY_ACCESS_TOKEN, SHOP_NAME
+  SHOPIFY_ACCESS_TOKEN, SHOP_NAME, SHOPIFY_API_VERSION
 } = process.env;
+
+// 🟢 Default to 2026-01 if variable is missing
+const API_VER = clean(SHOPIFY_API_VERSION) || '2026-01';
 
 const { Pool } = pg;
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
@@ -103,8 +107,8 @@ async function trackBluedart(awb) {
         handler: "tnt", 
         action: "custawbquery", 
         loginid: clean(LOGIN_ID), 
-        awb: "awb",        // 🟢 FIX: Literal string "awb" (Matches GAS)
-        numbers: awb,      // 🟢 FIX: The actual number goes here
+        awb: "awb",        // 🟢 FIXED: Literal string "awb" (Matches GAS)
+        numbers: awb,      // 🟢 FIXED: The actual number goes here
         format: "xml", 
         lickey: clean(BD_LICENCE_KEY_TRACK), 
         verno: 1, 
@@ -166,7 +170,7 @@ async function syncOrder(o) {
   const isReturn = o.name?.includes("-R") || false;
   const phone = o.phone || o.customer?.phone || o.shipping_address?.phone || null;
 
-  // 🟢 FIX: ID forced to String, Payment Gateway parsed safely
+  // 🟢 SAFETY: ID forced to String, Payment Gateway parsed safely, JSONB Casting
   await pool.query(`
     INSERT INTO orders_ops (id, order_number, financial_status, fulfillment_status, total_price, payment_gateway_names, customer_name, customer_email, customer_phone, city, line_items, is_exchange, is_return, source, created_at)
     VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11::jsonb, $12::boolean, $13::boolean, $14, $15)
@@ -186,7 +190,7 @@ async function updateStaleShipments() {
     for (const r of rows) {
       const t = r.courier_source === "bluedart" ? await trackBluedart(r.awb) : await trackShiprocket(r.awb);
       if (t) {
-        // 🟢 FIX: Raw Data captured with correct JSONB cast
+        // 🟢 SAFETY: Raw Data captured with correct JSONB cast
         await pool.query(`UPDATE shipments_ops SET delivered=$1, last_status=$2, last_state=$3, history=$4::jsonb, raw_data=$5::jsonb, last_checked_at=NOW() WHERE awb=$6`, 
         [t.delivered, t.status, resolveShipmentState(t.status), JSON.stringify(t.history || []), JSON.stringify(t.raw || {}), r.awb]);
       }
@@ -197,7 +201,8 @@ async function updateStaleShipments() {
 async function runBackfill() {
   if (!SHOPIFY_ACCESS_TOKEN || !SHOP_NAME) return;
   try {
-    const r = await axios.get(`https://${clean(SHOP_NAME)}.myshopify.com/admin/api/2023-10/orders.json?status=any&limit=50`, { headers: { "X-Shopify-Access-Token": clean(SHOPIFY_ACCESS_TOKEN) } });
+    // 🟢 UPDATED: Uses API_VER variable
+    const r = await axios.get(`https://${clean(SHOP_NAME)}.myshopify.com/admin/api/${API_VER}/orders.json?status=any&limit=50`, { headers: { "X-Shopify-Access-Token": clean(SHOPIFY_ACCESS_TOKEN) } });
     for (const o of r.data.orders || []) await syncOrder(o);
   } catch (e) { console.error("Backfill error:", e.message); }
 }
@@ -211,14 +216,17 @@ setInterval(() => { runBackfill(); updateStaleShipments(); }, 30 * 60 * 1000);
 app.post("/track/customer", async (req, res) => {
   const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
   if (!checkRateLimit(ip)) return res.status(429).json({ error: "Too many requests" });
-  const cleanInput = req.body?.phone?.replace(/\D/g, "").slice(-10);
+  
+  if (!req.body || !req.body.phone) return res.status(400).json({ error: "Phone required" });
+  const cleanInput = req.body.phone.toString().replace(/\D/g, "").slice(-10);
   if (!cleanInput) return res.status(400).json({ error: "Invalid phone" });
 
   try {
+    // 🟢 BUG FIX: Added '::text' casting to be 100% safe even if DB types drift
     const { rows } = await pool.query(`
       SELECT o.order_number, o.created_at, o.fulfillment_status, s.awb, s.courier_source, s.last_state, s.last_status, s.history as db_history
-      FROM orders_ops o LEFT JOIN shipments_ops s ON s.order_id = o.id 
-      WHERE o.customer_phone LIKE $1 ORDER BY o.created_at DESC LIMIT 5
+      FROM orders_ops o LEFT JOIN shipments_ops s ON s.order_id::text = o.id::text 
+      WHERE o.customer_phone::text LIKE $1 ORDER BY o.created_at DESC LIMIT 5
     `, [`%${cleanInput}`]);
 
     const results = rows.map((row) => {
