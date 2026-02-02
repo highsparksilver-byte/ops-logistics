@@ -9,7 +9,7 @@ import crypto from "crypto";
 ================================ */
 const app = express();
 const rateLimiter = new Map();
-axios.defaults.timeout = 8000;
+axios.defaults.timeout = 15000; // Extended for BlueDart
 
 setInterval(() => { rateLimiter.clear(); console.log("🧹 Rate limiter cleared"); }, 60 * 60 * 1000);
 
@@ -99,20 +99,33 @@ const IGNORE_SCANS = ["BAGGED", "MANIFEST", "NETWORK", "RELIEF", "PARTIAL"];
 async function trackBluedart(awb) {
   try {
     const r = await axios.get("https://api.bluedart.com/servlet/RoutingServlet", {
-      params: { handler: "tnt", action: "custawbquery", loginid: clean(LOGIN_ID), awb: awb, numbers: awb, format: "xml", lickey: clean(BD_LICENCE_KEY_TRACK), verno: 1, scan: 1 },
+      params: { 
+        handler: "tnt", 
+        action: "custawbquery", 
+        loginid: clean(LOGIN_ID), 
+        awb: "awb",        // 🟢 FIX: Literal string "awb" (Matches GAS)
+        numbers: awb,      // 🟢 FIX: The actual number goes here
+        format: "xml", 
+        lickey: clean(BD_LICENCE_KEY_TRACK), 
+        verno: 1, 
+        scan: 1 
+      },
       responseType: "text"
     });
-    if (!r.data || r.data.includes("<html")) return null;
+    
+    // 🛡️ Guard against HTML error pages
+    if (!r.data || r.data.trim().startsWith("<html")) return null; 
+    
     const p = await xml2js.parseStringPromise(r.data, { explicitArray: false });
     const s = p?.ShipmentData?.Shipment; if (!s) return null;
 
-    // 🟢 FIX 1: SAFETY GUARD - Never drop scans if delivered
+    // 🛡️ SAFETY: Never filter out the delivery scan
     const isFinal = s.Status?.toUpperCase().includes("DELIVERED");
     const rawScans = Array.isArray(s.Scans?.ScanDetail) ? s.Scans.ScanDetail : [s.Scans?.ScanDetail];
     
     const scans = rawScans.filter(x => {
       if (!x?.Scan) return false;
-      if (isFinal) return true; // Keep everything if delivered
+      if (isFinal) return true; 
       return !IGNORE_SCANS.some(k => x.Scan.toUpperCase().includes(k));
     });
 
@@ -149,14 +162,14 @@ async function predictShiprocketEDD(p){try{const t=await getShiprocketJwt();cons
    🔄 SYNC & BACKGROUND
 ================================ */
 async function syncOrder(o) {
-  const isExchange = o.name?.startsWith("EX-") || o.tags?.includes("exchange");
-  const isReturn = o.name?.includes("-R");
+  const isExchange = o.name?.startsWith("EX-") || o.tags?.includes("exchange") || false;
+  const isReturn = o.name?.includes("-R") || false;
   const phone = o.phone || o.customer?.phone || o.shipping_address?.phone || null;
 
-  // 🟢 FIX 2: String(o.id) for 64-bit safety
+  // 🟢 FIX: ID forced to String, Payment Gateway parsed safely
   await pool.query(`
     INSERT INTO orders_ops (id, order_number, financial_status, fulfillment_status, total_price, payment_gateway_names, customer_name, customer_email, customer_phone, city, line_items, is_exchange, is_return, source, created_at)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+    VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11::jsonb, $12::boolean, $13::boolean, $14, $15)
     ON CONFLICT (id) DO UPDATE SET financial_status = EXCLUDED.financial_status, fulfillment_status = EXCLUDED.fulfillment_status, customer_phone = EXCLUDED.customer_phone, city = EXCLUDED.city
   `, [String(o.id), o.name, o.financial_status, o.fulfillment_status, o.total_price, JSON.stringify(o.payment_gateway_names || []), `${o.customer?.first_name || ""} ${o.customer?.last_name || ""}`.trim(), o.email || o.customer?.email, phone, o.shipping_address?.city, JSON.stringify(o.line_items || []), isExchange, isReturn, "shopify", o.created_at]);
   
@@ -173,7 +186,7 @@ async function updateStaleShipments() {
     for (const r of rows) {
       const t = r.courier_source === "bluedart" ? await trackBluedart(r.awb) : await trackShiprocket(r.awb);
       if (t) {
-        // 🟢 FIX 3: Capture raw_data and cast jsonb correctly
+        // 🟢 FIX: Raw Data captured with correct JSONB cast
         await pool.query(`UPDATE shipments_ops SET delivered=$1, last_status=$2, last_state=$3, history=$4::jsonb, raw_data=$5::jsonb, last_checked_at=NOW() WHERE awb=$6`, 
         [t.delivered, t.status, resolveShipmentState(t.status), JSON.stringify(t.history || []), JSON.stringify(t.raw || {}), r.awb]);
       }
@@ -184,7 +197,7 @@ async function updateStaleShipments() {
 async function runBackfill() {
   if (!SHOPIFY_ACCESS_TOKEN || !SHOP_NAME) return;
   try {
-    const r = await axios.get(`https://${SHOP_NAME}.myshopify.com/admin/api/2023-10/orders.json?status=any&limit=50`, { headers: { "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN } });
+    const r = await axios.get(`https://${clean(SHOP_NAME)}.myshopify.com/admin/api/2023-10/orders.json?status=any&limit=50`, { headers: { "X-Shopify-Access-Token": clean(SHOPIFY_ACCESS_TOKEN) } });
     for (const o of r.data.orders || []) await syncOrder(o);
   } catch (e) { console.error("Backfill error:", e.message); }
 }
@@ -222,15 +235,16 @@ app.post("/track/customer", async (req, res) => {
       };
     });
     res.json({ orders: results });
-  } catch (e) { res.status(500).json({ error: "Server error" }); }
+  } catch (e) { 
+    console.error("Tracking Error:", e.message);
+    res.status(500).json({ error: "Server error" }); 
+  }
 });
 
 /* ===============================
    📅 EDD (Product Page)
 ================================ */
 const eddCache = new Map();
-
-// 🟢 FIX 4: Cache reset at 11 AM IST
 function msUntil11AM() {
   const now = new Date();
   const next = new Date();
