@@ -25,10 +25,14 @@ app.use(express.json({
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, x-admin-key"
+  );
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
 });
+
 
 const clean = v => v?.replace(/\r|\n|\t/g, "").trim();
 const {
@@ -293,6 +297,41 @@ app.get("/ops/track/awb", async (req, res) => {
     res.json({ awb: row.awb, current_state: row.last_state || "PROCESSING", last_status: tracking?.status || row.last_status, tracking_history: tracking?.history || [] });
   } catch (e) { res.status(500).json({ error: "Server error" }); }
 });
+
+/* ===============================
+   📋 OPS ORDERS LIST
+================================ */
+app.get("/ops/orders", async (req, res) => {
+  if (!verifyAdmin(req)) {
+    return res.status(403).json({ error: "Unauthorized" });
+  }
+
+  try {
+    const { rows } = await pool.query(`
+      SELECT 
+        o.id,
+        o.order_number,
+        o.created_at,
+        o.financial_status,
+        o.fulfillment_status,
+        o.total_price,
+        s.awb,
+        s.courier_source,
+        s.last_state,
+        s.last_status
+      FROM orders_ops o
+      LEFT JOIN shipments_ops s ON s.order_id = o.id
+      ORDER BY o.created_at DESC
+      LIMIT 50
+    `);
+
+    res.json({ orders: rows });
+  } catch (e) {
+    console.error("OPS ORDERS ERROR", e);
+    res.status(500).json({ error: "Failed to load orders" });
+  }
+});
+
 
 // ADMIN & WEBHOOKS
 app.get("/admin/sync-shopify", async (req, res) => { if (!verifyAdmin(req)) return res.status(403).send("Unauthorized"); const r = await runBackfill(req.query.limit || 50); res.send(r.success ? `✅ Synced ${r.count} orders.` : `❌ Failed: ${r.error}`); });
