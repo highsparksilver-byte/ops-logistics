@@ -349,43 +349,78 @@ app.post("/webhooks/returnprime", async (req, res) => {
 });
 
 /* ===============================
-   🔍 CUSTOMER ENDPOINT (HYBRID LIVE)
+   ✅ UPDATED: PAGINATED ORDERS ENDPOINT (SMART DATA EDITION)
 ================================ */
-app.post("/track/customer", async (req, res) => {
-  const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
-  if (!checkRateLimit(ip)) return res.status(429).json({ error: "Too many requests" });
-  if (!req.body?.phone) return res.status(400).json({ error: "Phone required" });
-
+app.get("/ops/orders", async (req, res) => {
+  if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
+  
   try {
-    const cleanInput = req.body.phone.toString().replace(/\D/g, "").slice(-10);
-    const { rows } = await pool.query(`SELECT o.order_number, o.created_at, o.fulfillment_status, s.awb, s.courier_source, s.last_state, s.last_status, s.history as db_history, s.last_checked_at FROM orders_ops o LEFT JOIN shipments_ops s ON s.order_id::text = o.id::text WHERE o.customer_phone::text LIKE $1 ORDER BY o.created_at DESC LIMIT 5`, [`%${cleanInput}`]);
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 50;
+    const offset = (page - 1) * limit;
 
-    const promises = rows.map(async (row) => {
-      if (!row.awb || row.last_state === 'DELIVERED') return row; 
-      const lastCheck = row.last_checked_at ? new Date(row.last_checked_at).getTime() : 0;
-      if (Date.now() - lastCheck > 60 * 1000) { // 1 min stale check
-        const fresh = await forceRefreshShipment(row.awb, row.courier_source);
-        if (fresh) {
-           row.last_state = resolveShipmentState(fresh.status);
-           row.last_status = fresh.status;
-           row.db_history = fresh.history;
-        }
+    // 🟢 UPDATED SQL QUERY
+    const query = `
+      SELECT 
+        o.id,
+        o.order_number,
+        o.created_at,
+        o.financial_status,
+        o.fulfillment_status,
+        o.total_price,
+        o.payment_gateway_names,
+        o.line_items,
+        o.is_exchange,
+        o.is_return,
+        o.source,
+        
+        -- Smart Customer Data (Fallback to Shipment Data if Shopify is null)
+        COALESCE(o.customer_name, s.raw_data->'shipment_track'->0->>'consignee_name', 'Guest') as customer_name,
+        COALESCE(o.customer_email, s.raw_data->'shipment_track'->0->>'email') as customer_email,
+        COALESCE(o.customer_phone, s.raw_data->'shipment_track'->0->>'mobile') as customer_phone,
+        COALESCE(o.city, s.raw_data->'shipment_track'->0->>'destination') as city,
+        
+        -- Shipment Core
+        s.awb, 
+        s.courier_source,
+        s.last_state, 
+        s.last_status,
+        
+        -- Extracted Dates
+        s.raw_data->'shipment_track'->0->>'delivered_date' as delivered_date,
+        s.raw_data->'shipment_track'->0->>'edd' as expected_delivery_date,
+
+        -- Smart NDR Extraction (Finds latest failure remark)
+        (
+          SELECT activity 
+          FROM jsonb_to_recordset(s.raw_data->'shipment_track_activities') as x(activity text, "sr-status" text)
+          WHERE "sr-status" IN ('6', '13', '14', '19', '20', '21', '53', '54', '55', '56') 
+          LIMIT 1
+        ) as ndr_reason,
+
+        r.status AS return_status 
+
+      FROM orders_ops o 
+      LEFT JOIN shipments_ops s ON s.order_id::text = o.id::text 
+      LEFT JOIN returns_ops r ON r.order_number::text = o.order_number::text 
+      ORDER BY o.created_at DESC 
+      LIMIT $1 OFFSET $2
+    `;
+
+    const { rows } = await pool.query(query, [limit, offset]);
+    const countRes = await pool.query(`SELECT COUNT(*) FROM orders_ops`);
+
+    res.json({ 
+      orders: rows,
+      pagination: {
+        total: parseInt(countRes.rows[0].count),
+        page,
+        totalPages: Math.ceil(parseInt(countRes.rows[0].count) / limit)
       }
-      return row;
     });
 
-    const refreshedRows = await Promise.all(promises);
-    const results = refreshedRows.map((row) => {
-      let history = [{ status: "Ordered", date: new Date(row.created_at).toDateString(), completed: true }];
-      if (row.fulfillment_status === 'fulfilled') history.push({ status: "Dispatched", date: "Order Packed", completed: true });
-      if (Array.isArray(row.db_history)) history = [...history, ...row.db_history];
-
-      return { shopify_order_name: row.order_number, awb: row.awb, current_state: row.last_state || (row.fulfillment_status === 'fulfilled' ? "IN_TRANSIT" : "PROCESSING"), courier: row.courier_source, last_known_status: row.last_status || "Shipment information will be updated shortly", tracking_history: history };
-    });
-    res.json({ orders: results });
   } catch (e) { 
-    logEvent('ERROR', 'TRACKING', 'Customer Track Error', { error: e.message });
-    res.status(500).json({ error: "Server error" }); 
+    res.status(500).json({ error: "Db Error: " + e.message }); 
   }
 });
 
