@@ -349,7 +349,7 @@ app.post("/webhooks/returnprime", async (req, res) => {
 });
 
 /* ===============================
-   ✅ UPDATED: PAGINATED ORDERS ENDPOINT (SMART DATA EDITION)
+   ✅ UPDATED: PAGINATED ORDERS ENDPOINT (ADDRESS & NDR)
 ================================ */
 app.get("/ops/orders", async (req, res) => {
   if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
@@ -359,7 +359,6 @@ app.get("/ops/orders", async (req, res) => {
     const limit = parseInt(req.query.limit) || 50;
     const offset = (page - 1) * limit;
 
-    // 🟢 UPDATED SQL QUERY
     const query = `
       SELECT 
         o.id,
@@ -374,23 +373,31 @@ app.get("/ops/orders", async (req, res) => {
         o.is_return,
         o.source,
         
-        -- Smart Customer Data (Fallback to Shipment Data if Shopify is null)
+        -- Smart Customer Data
         COALESCE(o.customer_name, s.raw_data->'shipment_track'->0->>'consignee_name', 'Guest') as customer_name,
         COALESCE(o.customer_email, s.raw_data->'shipment_track'->0->>'email') as customer_email,
         COALESCE(o.customer_phone, s.raw_data->'shipment_track'->0->>'mobile') as customer_phone,
-        COALESCE(o.city, s.raw_data->'shipment_track'->0->>'destination') as city,
         
+        -- 🟢 ADDRESS EXTRACTION (Shopify stores this as JSONB usually, or separate cols. Assuming standard)
+        -- If you stored address as JSONB in 'shipping_address' column:
+        o.city, 
+        -- Construct Full Address from available fields or Shipment data
+        COALESCE(
+          CONCAT(s.raw_data->'shipment_track'->0->>'destination', ' ', s.raw_data->'shipment_track'->0->>'location'),
+          o.city -- Fallback
+        ) as full_address,
+
         -- Shipment Core
         s.awb, 
         s.courier_source,
         s.last_state, 
         s.last_status,
         
-        -- Extracted Dates
+        -- Dates
         s.raw_data->'shipment_track'->0->>'delivered_date' as delivered_date,
         s.raw_data->'shipment_track'->0->>'edd' as expected_delivery_date,
 
-        -- Smart NDR Extraction (Finds latest failure remark)
+        -- NDR Extraction
         (
           SELECT activity 
           FROM jsonb_to_recordset(s.raw_data->'shipment_track_activities') as x(activity text, "sr-status" text)
