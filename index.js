@@ -17,7 +17,7 @@ app.use(express.json({ limit: "2mb", verify: (req, res, buf) => { req.rawBody = 
 
 app.use((req, res, next) => {
   const allowedOrigins = [
-    "https://your-new-vercel-app.vercel.app", // 👈 Add your Vercel URL here
+    "https://vercel.com/highsparksilver-1315s-projects/ops-dashboard/4KyeF9EQyBmsDhTBzC23F7TbxE4q", // 👈 Add your Vercel URL here
     "http://localhost:3000"
   ];
   const origin = req.headers.origin;
