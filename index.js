@@ -17,7 +17,7 @@ app.use(express.json({ limit: "2mb", verify: (req, res, buf) => { req.rawBody = 
 
 app.use((req, res, next) => {
   const allowedOrigins = [
-    "https://vercel.com/highsparksilver-1315s-projects/ops-dashboard/4KyeF9EQyBmsDhTBzC23F7TbxE4q", // 👈 Add your Vercel URL here
+    "https://ops-dashboard-3c9eyrxoa-highsparksilver-1315s-projects.vercel.app", // 👈 Add your Vercel URL here
     "http://localhost:3000"
   ];
   const origin = req.headers.origin;
@@ -430,12 +430,50 @@ app.post("/edd", async (req, res) => {
   res.json(data);
 });
 
+/* ===============================
+   ✅ UPDATED: PAGINATED ORDERS ENDPOINT
+================================ */
 app.get("/ops/orders", async (req, res) => {
   if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
+  
   try {
-    const { rows } = await pool.query(`SELECT o.*, s.awb, s.last_state, r.status AS return_status FROM orders_ops o LEFT JOIN shipments_ops s ON s.order_id::text = o.id::text LEFT JOIN returns_ops r ON r.order_number::text = o.order_number::text ORDER BY o.created_at DESC LIMIT 100`);
-    res.json({ orders: rows });
-  } catch (e) { res.status(500).json({ error: "Db Error: " + e.message }); }
+    // 1. Get Page & Limit from URL (default to Page 1, 50 items)
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 50;
+    const offset = (page - 1) * limit;
+
+    // 2. Fetch Paginated Data
+    const { rows } = await pool.query(`
+      SELECT 
+        o.*, 
+        s.awb, 
+        s.last_state, 
+        s.last_status,
+        s.courier_source, -- Added this so icons work properly
+        r.status AS return_status 
+      FROM orders_ops o 
+      LEFT JOIN shipments_ops s ON s.order_id::text = o.id::text 
+      LEFT JOIN returns_ops r ON r.order_number::text = o.order_number::text 
+      ORDER BY o.created_at DESC 
+      LIMIT $1 OFFSET $2
+    `, [limit, offset]);
+
+    // 3. Get Total Count (For "Page 1 of X" logic)
+    const countRes = await pool.query(`SELECT COUNT(*) FROM orders_ops`);
+    const total = parseInt(countRes.rows[0].count);
+
+    res.json({ 
+      orders: rows,
+      pagination: {
+        total,
+        page,
+        totalPages: Math.ceil(total / limit)
+      }
+    });
+
+  } catch (e) { 
+    res.status(500).json({ error: "Db Error: " + e.message }); 
+  }
 });
 
 app.get("/recon/ops", async (req, res) => {
