@@ -229,11 +229,18 @@ async function syncOrder(o) {
 async function updateStaleShipments() {
   try {
     const { rows } = await pool.query(`SELECT awb, courier_source FROM shipments_ops WHERE delivered = FALSE AND (last_checked_at IS NULL OR last_checked_at < NOW() - INTERVAL '30 minutes') LIMIT 15`);
+    
     for (const r of rows) {
       const t = r.courier_source === "bluedart" ? await trackBluedart(r.awb) : await trackShiprocket(r.awb);
+      
       if (t) {
+        // ✅ Success: Update Status & Timestamp
         await pool.query(`UPDATE shipments_ops SET delivered=$1, last_status=$2, last_state=$3, history=$4::jsonb, raw_data=$5::jsonb, last_checked_at=NOW() WHERE awb=$6`, 
         [t.delivered, t.status, resolveShipmentState(t.status), JSON.stringify(t.history || []), JSON.stringify(t.raw || {}), r.awb]);
+      } else {
+        // ⚠️ Failure: "Touch" the row so we don't get stuck on it forever
+        console.log(`⚠️ Marking failed AWB as checked: ${r.awb}`);
+        await pool.query(`UPDATE shipments_ops SET last_checked_at=NOW() WHERE awb=$1`, [r.awb]);
       }
     }
   } catch (e) { logEvent('ERROR', 'SYNC', 'Stale Update Loop Failed', { error: e.message }); }
