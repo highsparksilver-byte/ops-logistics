@@ -17,7 +17,7 @@ app.use(express.json({ limit: "2mb", verify: (req, res, buf) => { req.rawBody = 
 
 app.use((req, res, next) => {
   const allowedOrigins = [
-    "https://ops-dashboard-3c9eyrxoa-highsparksilver-1315s-projects.vercel.app", // 👈 Add your Vercel URL here
+    "https://ops-dashboard-3c9eyrxoa-highsparksilver-1315s-projects.vercel.app", 
     "http://localhost:3000"
   ];
   const origin = req.headers.origin;
@@ -25,7 +25,6 @@ app.use((req, res, next) => {
   if (allowedOrigins.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   } else {
-    // Optional: Allow all during testing (less secure)
     res.setHeader("Access-Control-Allow-Origin", "*");
   }
   
@@ -44,10 +43,20 @@ const {
 
 const API_VER = clean(SHOPIFY_API_VERSION) || '2026-01';
 const { Pool } = pg;
-const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
 /* ===============================
-   🕒 DATE HELPERS (THE MISSING PIECE)
+   🛠️ DB MIGRATION (Auto-Add Address Col)
+================================ */
+const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
+
+// Run this once on startup to fix the table structure
+pool.query(`
+  ALTER TABLE orders_ops 
+  ADD COLUMN IF NOT EXISTS shipping_address JSONB;
+`).catch(e => console.log("Migration Note: " + e.message));
+
+/* ===============================
+   🕒 DATE HELPERS
 ================================ */
 function nowIST() {
   const d = new Date();
@@ -56,9 +65,8 @@ function nowIST() {
 
 function getNextWorkingDate() {
   const d = nowIST();
-  // If today is Sunday, move pickup to Monday
   if (d.getDay() === 0) d.setDate(d.getDate() + 1); 
-  return `/Date(${d.getTime()})/`; // 👈 The specific format BlueDart needs
+  return `/Date(${d.getTime()})/`; 
 }
 
 /* ===============================
@@ -121,11 +129,8 @@ function formatConfidenceBand(dStr) {
   if (!dStr) return null;
   const s = new Date(dStr); 
   if (isNaN(s.getTime())) return null;
-
-  // Simple Logic: Promised Date + 1 Day Buffer
   const e = new Date(s); 
   e.setDate(e.getDate() + 1);
-
   const f = d => d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
   return `${f(s)} - ${f(e)}`;
 }
@@ -220,7 +225,7 @@ async function trackShiprocket(awb) {
 
 async function getCity(p){try{const r=await axios.get(`https://api.postalpincode.in/pincode/${p}`);return r.data?.[0]?.PostOffice?.[0]?.District||null}catch{return null}}
 
-// 🟢 PREDICT BLUEDART EDD (Fixed Date Format)
+// 🟢 PREDICT BLUEDART EDD
 async function predictBluedartEDD(p) {
   try {
     const j = await getBluedartJwt();
@@ -230,7 +235,7 @@ async function predictBluedartEDD(p) {
       pPinCodeTo: p,
       pProductCode: "A",
       pSubProductCode: "P",
-      pPudate: getNextWorkingDate(), // ✅ Uses correct format now
+      pPudate: getNextWorkingDate(), 
       pPickupTime: "16:00",
       profile: { Api_type: "S", LicenceKey: clean(BD_LICENCE_KEY_EDD), LoginID: clean(LOGIN_ID) }
     }, { headers: { JWTToken: j } });
@@ -247,20 +252,56 @@ async function predictShiprocketEDD(p){try{const t=await getShiprocketJwt();if(!
    🔄 SYNC & BACKGROUND
 ================================ */
 async function syncOrder(o) {
+  // Try to find phone in multiple places
   const phone = o.phone || o.customer?.phone || o.shipping_address?.phone || null;
+  
   try {
     await pool.query(`
-      INSERT INTO orders_ops (id, order_number, financial_status, fulfillment_status, total_price, payment_gateway_names, customer_name, customer_email, customer_phone, city, line_items, is_exchange, is_return, source, created_at)
-      VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11::jsonb, $12::boolean, $13::boolean, $14, $15)
-      ON CONFLICT (id) DO UPDATE SET financial_status = EXCLUDED.financial_status, fulfillment_status = EXCLUDED.fulfillment_status, customer_phone = EXCLUDED.customer_phone, city = EXCLUDED.city
-    `, [String(o.id), o.name, o.financial_status, o.fulfillment_status, o.total_price, JSON.stringify(o.payment_gateway_names || []), `${o.customer?.first_name || ""} ${o.customer?.last_name || ""}`.trim(), o.email || o.customer?.email, phone, o.shipping_address?.city, JSON.stringify(o.line_items || []), o.name?.startsWith("EX-") || false, o.name?.includes("-R") || false, "shopify", o.created_at]);
+      INSERT INTO orders_ops (
+        id, order_number, financial_status, fulfillment_status, total_price, 
+        payment_gateway_names, customer_name, customer_email, customer_phone, 
+        city, shipping_address, line_items, is_exchange, is_return, source, created_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13::boolean, $14::boolean, $15, $16)
+      ON CONFLICT (id) DO UPDATE SET 
+        financial_status = EXCLUDED.financial_status, 
+        fulfillment_status = EXCLUDED.fulfillment_status, 
+        customer_phone = EXCLUDED.customer_phone, 
+        shipping_address = EXCLUDED.shipping_address, -- Update address if it changes
+        city = EXCLUDED.city
+    `, [
+      String(o.id), 
+      o.name, 
+      o.financial_status, 
+      o.fulfillment_status, 
+      o.total_price, 
+      JSON.stringify(o.payment_gateway_names || []), 
+      `${o.customer?.first_name || ""} ${o.customer?.last_name || ""}`.trim(), 
+      o.email || o.customer?.email, 
+      phone, 
+      o.shipping_address?.city, 
+      JSON.stringify(o.shipping_address || {}), // 🟢 SAVING FULL ADDRESS HERE
+      JSON.stringify(o.line_items || []), 
+      o.name?.startsWith("EX-") || false, 
+      o.name?.includes("-R") || false, 
+      "shopify", 
+      o.created_at
+    ]);
     
+    // Sync Fulfillments
     if (o.fulfillments) {
       for (const f of o.fulfillments) {
-        if (f.tracking_number) await pool.query(`INSERT INTO shipments_ops (awb, order_id, courier_source) VALUES ($1,$2,$3) ON CONFLICT (awb) DO NOTHING`, [f.tracking_number, String(o.id), f.tracking_company?.toLowerCase().includes("blue") ? "bluedart" : "shiprocket"]);
+        if (f.tracking_number) {
+          await pool.query(
+            `INSERT INTO shipments_ops (awb, order_id, courier_source) VALUES ($1,$2,$3) ON CONFLICT (awb) DO NOTHING`, 
+            [f.tracking_number, String(o.id), f.tracking_company?.toLowerCase().includes("blue") ? "bluedart" : "shiprocket"]
+          );
+        }
       }
     }
-  } catch (e) { logEvent('ERROR', 'SYNC', `Order Sync Failed: ${o.name}`, { error: e.message }); }
+  } catch (e) { 
+    logEvent('ERROR', 'SYNC', `Order Sync Failed: ${o.name}`, { error: e.message }); 
+  }
 }
 
 async function updateStaleShipments() {
@@ -349,7 +390,48 @@ app.post("/webhooks/returnprime", async (req, res) => {
 });
 
 /* ===============================
-   ✅ UPDATED: PAGINATED ORDERS ENDPOINT (ADDRESS & NDR)
+   🔍 CUSTOMER ENDPOINT (HYBRID LIVE)
+================================ */
+app.post("/track/customer", async (req, res) => {
+  const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
+  if (!checkRateLimit(ip)) return res.status(429).json({ error: "Too many requests" });
+  if (!req.body?.phone) return res.status(400).json({ error: "Phone required" });
+
+  try {
+    const cleanInput = req.body.phone.toString().replace(/\D/g, "").slice(-10);
+    const { rows } = await pool.query(`SELECT o.order_number, o.created_at, o.fulfillment_status, s.awb, s.courier_source, s.last_state, s.last_status, s.history as db_history, s.last_checked_at FROM orders_ops o LEFT JOIN shipments_ops s ON s.order_id::text = o.id::text WHERE o.customer_phone::text LIKE $1 ORDER BY o.created_at DESC LIMIT 5`, [`%${cleanInput}`]);
+
+    const promises = rows.map(async (row) => {
+      if (!row.awb || row.last_state === 'DELIVERED') return row; 
+      const lastCheck = row.last_checked_at ? new Date(row.last_checked_at).getTime() : 0;
+      if (Date.now() - lastCheck > 60 * 1000) { // 1 min stale check
+        const fresh = await forceRefreshShipment(row.awb, row.courier_source);
+        if (fresh) {
+           row.last_state = resolveShipmentState(fresh.status);
+           row.last_status = fresh.status;
+           row.db_history = fresh.history;
+        }
+      }
+      return row;
+    });
+
+    const refreshedRows = await Promise.all(promises);
+    const results = refreshedRows.map((row) => {
+      let history = [{ status: "Ordered", date: new Date(row.created_at).toDateString(), completed: true }];
+      if (row.fulfillment_status === 'fulfilled') history.push({ status: "Dispatched", date: "Order Packed", completed: true });
+      if (Array.isArray(row.db_history)) history = [...history, ...row.db_history];
+
+      return { shopify_order_name: row.order_number, awb: row.awb, current_state: row.last_state || (row.fulfillment_status === 'fulfilled' ? "IN_TRANSIT" : "PROCESSING"), courier: row.courier_source, last_known_status: row.last_status || "Shipment information will be updated shortly", tracking_history: history };
+    });
+    res.json({ orders: results });
+  } catch (e) { 
+    logEvent('ERROR', 'TRACKING', 'Customer Track Error', { error: e.message });
+    res.status(500).json({ error: "Server error" }); 
+  }
+});
+
+/* ===============================
+   ✅ UPDATED: PAGINATED ORDERS ENDPOINT (FINAL)
 ================================ */
 app.get("/ops/orders", async (req, res) => {
   if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
@@ -373,18 +455,18 @@ app.get("/ops/orders", async (req, res) => {
         o.is_return,
         o.source,
         
-        -- Smart Customer Data
+        -- Smart Customer Info
         COALESCE(o.customer_name, s.raw_data->'shipment_track'->0->>'consignee_name', 'Guest') as customer_name,
         COALESCE(o.customer_email, s.raw_data->'shipment_track'->0->>'email') as customer_email,
         COALESCE(o.customer_phone, s.raw_data->'shipment_track'->0->>'mobile') as customer_phone,
         
-        -- 🟢 ADDRESS EXTRACTION (Shopify stores this as JSONB usually, or separate cols. Assuming standard)
-        -- If you stored address as JSONB in 'shipping_address' column:
-        o.city, 
-        -- Construct Full Address from available fields or Shipment data
+        -- 🟢 SMART ADDRESS (Shopify First, then Courier)
+        COALESCE(o.city, s.raw_data->'shipment_track'->0->>'destination') as city,
+        
         COALESCE(
-          CONCAT(s.raw_data->'shipment_track'->0->>'destination', ' ', s.raw_data->'shipment_track'->0->>'location'),
-          o.city -- Fallback
+           CONCAT(o.shipping_address->>'address1', ', ', o.shipping_address->>'address2', ', ', o.shipping_address->>'city', ' - ', o.shipping_address->>'zip'),
+           CONCAT(s.raw_data->'shipment_track'->0->>'destination', ' ', s.raw_data->'shipment_track'->0->>'location'),
+           o.city
         ) as full_address,
 
         -- Shipment Core
@@ -393,11 +475,10 @@ app.get("/ops/orders", async (req, res) => {
         s.last_state, 
         s.last_status,
         
-        -- Dates
+        -- Dates & NDR
         s.raw_data->'shipment_track'->0->>'delivered_date' as delivered_date,
         s.raw_data->'shipment_track'->0->>'edd' as expected_delivery_date,
 
-        -- NDR Extraction
         (
           SELECT activity 
           FROM jsonb_to_recordset(s.raw_data->'shipment_track_activities') as x(activity text, "sr-status" text)
@@ -440,82 +521,6 @@ app.get("/ops/logs", async (req, res) => {
     const { rows } = await pool.query(`SELECT * FROM system_logs ORDER BY timestamp DESC LIMIT 50`);
     res.json({ logs: rows });
   } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post("/edd", async (req, res) => {
-  const { pincode } = req.body;
-  if (!/^\d{6}$/.test(pincode)) return res.json({ edd_display: null });
-  
-  if (eddCache.has(pincode)) return res.json(eddCache.get(pincode));
-
-  const city = await getCity(pincode);
-  
-  // 🟢 LOGIC: BlueDart First
-  let rawDate = await predictBluedartEDD(pincode);
-  let source = "BlueDart"; 
-
-  if (!rawDate) {
-    rawDate = await predictShiprocketEDD(pincode);
-    source = "Shiprocket";
-  }
-  
-  if (!rawDate) return res.json({ edd_display: null });
-  
-  const data = { 
-    edd_display: formatConfidenceBand(rawDate), 
-    city, 
-    badge: city && ["MUMBAI","DELHI","BANGALORE","PUNE"].some(m=>city.toUpperCase().includes(m)) ? "METRO_EXPRESS" : "EXPRESS",
-    source: source 
-  };
-  
-  eddCache.set(pincode, data);
-  res.json(data);
-});
-
-/* ===============================
-   ✅ UPDATED: PAGINATED ORDERS ENDPOINT
-================================ */
-app.get("/ops/orders", async (req, res) => {
-  if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
-  
-  try {
-    // 1. Get Page & Limit from URL (default to Page 1, 50 items)
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 50;
-    const offset = (page - 1) * limit;
-
-    // 2. Fetch Paginated Data
-    const { rows } = await pool.query(`
-      SELECT 
-        o.*, 
-        s.awb, 
-        s.last_state, 
-        s.last_status,
-        s.courier_source, -- Added this so icons work properly
-        r.status AS return_status 
-      FROM orders_ops o 
-      LEFT JOIN shipments_ops s ON s.order_id::text = o.id::text 
-      LEFT JOIN returns_ops r ON r.order_number::text = o.order_number::text 
-      ORDER BY o.created_at DESC 
-      LIMIT $1 OFFSET $2
-    `, [limit, offset]);
-
-    // 3. Get Total Count (For "Page 1 of X" logic)
-    const countRes = await pool.query(`SELECT COUNT(*) FROM orders_ops`);
-    const total = parseInt(countRes.rows[0].count);
-
-    res.json({ 
-      orders: rows,
-      pagination: {
-        total,
-        page,
-        totalPages: Math.ceil(total / limit)
-      }
-    });
-
-  } catch (e) { 
-    res.status(500).json({ error: "Db Error: " + e.message }); 
-  }
 });
 
 app.get("/recon/ops", async (req, res) => {
