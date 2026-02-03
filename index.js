@@ -14,6 +14,7 @@ axios.defaults.timeout = 15000;
 
 setInterval(() => { rateLimiter.clear(); console.log("🧹 Rate limiter cleared"); }, 60 * 60 * 1000);
 
+// 🟢 Capture Raw Body for Webhook Verification
 app.use(express.json({ limit: "2mb", verify: (req, res, buf) => { req.rawBody = buf.toString(); } }));
 
 app.use((req, res, next) => {
@@ -58,13 +59,21 @@ function formatConfidenceBand(dStr) {
 }
 
 /* ===============================
-   🔐 SECURITY
+   🔐 SECURITY & HELPERS
 ================================ */
 function verifyShopify(req) {
   const secret = clean(SHOPIFY_WEBHOOK_SECRET);
-  if (!secret || !req.rawBody) return false;
+  if (!secret || !req.rawBody) {
+    console.log("⚠️ Webhook Skipped: No Secret or Body");
+    return false;
+  }
   const digest = crypto.createHmac("sha256", secret).update(req.rawBody).digest("base64");
-  return digest === req.headers["x-shopify-hmac-sha256"];
+  const received = req.headers["x-shopify-hmac-sha256"];
+  
+  if (digest === received) return true;
+  
+  console.log(`⚠️ Webhook Signature Mismatch! Expected: ${digest}, Got: ${received}`);
+  return false;
 }
 
 function verifyAdmin(req) {
@@ -186,11 +195,11 @@ async function syncOrder(o) {
 
 async function updateStaleShipments() {
   try {
+    // Background worker: Updates oldest 15 stale shipments
     const { rows } = await pool.query(`SELECT awb, courier_source FROM shipments_ops WHERE delivered = FALSE AND (last_checked_at IS NULL OR last_checked_at < NOW() - INTERVAL '30 minutes') LIMIT 15`);
     for (const r of rows) {
       const t = r.courier_source === "bluedart" ? await trackBluedart(r.awb) : await trackShiprocket(r.awb);
       if (t) {
-        // 🟢 SAFETY: Raw Data captured with correct JSONB cast
         await pool.query(`UPDATE shipments_ops SET delivered=$1, last_status=$2, last_state=$3, history=$4::jsonb, raw_data=$5::jsonb, last_checked_at=NOW() WHERE awb=$6`, 
         [t.delivered, t.status, resolveShipmentState(t.status), JSON.stringify(t.history || []), JSON.stringify(t.raw || {}), r.awb]);
       }
@@ -201,7 +210,6 @@ async function updateStaleShipments() {
 async function runBackfill() {
   if (!SHOPIFY_ACCESS_TOKEN || !SHOP_NAME) return;
   try {
-    // 🟢 UPDATED: Uses API_VER variable
     const r = await axios.get(`https://${clean(SHOP_NAME)}.myshopify.com/admin/api/${API_VER}/orders.json?status=any&limit=50`, { headers: { "X-Shopify-Access-Token": clean(SHOPIFY_ACCESS_TOKEN) } });
     for (const o of r.data.orders || []) await syncOrder(o);
   } catch (e) { console.error("Backfill error:", e.message); }
@@ -211,37 +219,122 @@ setTimeout(runBackfill, 5000);
 setInterval(() => { runBackfill(); updateStaleShipments(); }, 30 * 60 * 1000);
 
 /* ===============================
-   🔍 CUSTOMER ENDPOINT (DB-ONLY)
+   ⚡️ INSTANT SYNC HELPER (NEW)
+================================ */
+async function forceRefreshShipment(awb, courier) {
+  if (!awb) return null;
+  const t = courier === "bluedart" ? await trackBluedart(awb) : await trackShiprocket(awb);
+  if (t) {
+    // Save to DB immediately so next time it's fast
+    await pool.query(`
+      UPDATE shipments_ops 
+      SET delivered=$1, last_status=$2, last_state=$3, history=$4::jsonb, raw_data=$5::jsonb, last_checked_at=NOW() 
+      WHERE awb=$6
+    `, [t.delivered, t.status, resolveShipmentState(t.status), JSON.stringify(t.history || []), JSON.stringify(t.raw || {}), awb]);
+  }
+  return t;
+}
+
+/* ===============================
+   🔔 WEBHOOKS (Updated)
+================================ */
+// 1. Order Paid
+app.post("/webhooks/orders_paid", (req, res) => { 
+  console.log("🔔 Webhook received: orders_paid");
+  res.sendStatus(200); 
+  if (verifyShopify(req)) {
+    console.log(`✅ Syncing Order ${req.body.name}`);
+    syncOrder(req.body); 
+  }
+});
+
+// 2. Fulfillment Create
+app.post("/webhooks/fulfillments_create", async (req, res) => {
+  console.log("🔔 Webhook received: fulfillments_create");
+  res.sendStatus(200); 
+  if (!verifyShopify(req) || !req.body.tracking_number) return;
+  
+  const courier = req.body.tracking_company?.toLowerCase().includes("blue") ? "bluedart" : "shiprocket";
+  console.log(`✅ Syncing Fulfillment: ${req.body.tracking_number} (${courier})`);
+  await pool.query(`INSERT INTO shipments_ops (awb, order_id, courier_source) VALUES ($1,$2,$3) ON CONFLICT (awb) DO NOTHING`, [req.body.tracking_number, String(req.body.order_id), courier]);
+});
+
+// 3. Order Cancelled
+app.post("/webhooks/orders_cancelled", async (req, res) => {
+  console.log("🔔 Webhook received: orders_cancelled");
+  res.sendStatus(200);
+  if (verifyShopify(req)) {
+    console.log(`❌ Order Cancelled: ${req.body.name}`);
+    await pool.query(`UPDATE orders_ops SET financial_status = 'cancelled' WHERE id = $1::text`, [String(req.body.id)]);
+  }
+});
+
+// 4. ReturnPrime
+app.post("/webhooks/returnprime", async (req, res) => {
+  res.sendStatus(200); const e = req.body;
+  if (!e.id || !e.order_number) return;
+  await pool.query(`INSERT INTO returns_ops (return_id, order_number, status, updated_at) VALUES ($1,$2,$3,NOW()) ON CONFLICT (return_id) DO UPDATE SET status=EXCLUDED.status, updated_at=NOW()`, [String(e.id), e.order_number, e.status || "created"]);
+});
+
+/* ===============================
+   🔍 CUSTOMER ENDPOINT (HYBRID LIVE)
 ================================ */
 app.post("/track/customer", async (req, res) => {
   const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
   if (!checkRateLimit(ip)) return res.status(429).json({ error: "Too many requests" });
-  
-  if (!req.body || !req.body.phone) return res.status(400).json({ error: "Phone required" });
-  const cleanInput = req.body.phone.toString().replace(/\D/g, "").slice(-10);
-  if (!cleanInput) return res.status(400).json({ error: "Invalid phone" });
+  if (!req.body?.phone) return res.status(400).json({ error: "Phone required" });
 
   try {
-    // 🟢 BUG FIX: Added '::text' casting to be 100% safe even if DB types drift
+    const cleanInput = req.body.phone.toString().replace(/\D/g, "").slice(-10);
+    
+    // 1. Get Orders from DB
+    // 🟢 BUG FIX: Added '::text' casting
     const { rows } = await pool.query(`
-      SELECT o.order_number, o.created_at, o.fulfillment_status, s.awb, s.courier_source, s.last_state, s.last_status, s.history as db_history
+      SELECT o.order_number, o.created_at, o.fulfillment_status, s.awb, s.courier_source, s.last_state, s.last_status, s.history as db_history, s.last_checked_at
       FROM orders_ops o LEFT JOIN shipments_ops s ON s.order_id::text = o.id::text 
       WHERE o.customer_phone::text LIKE $1 ORDER BY o.created_at DESC LIMIT 5
     `, [`%${cleanInput}`]);
 
-    const results = rows.map((row) => {
+    // 2. ⚡️ LIVE REFRESH: If data is older than 15 mins, fetch FRESH data now
+    const promises = rows.map(async (row) => {
+      // If no AWB or Delivered, use DB data
+      if (!row.awb || row.last_state === 'DELIVERED') return row; 
+      
+      const lastCheck = row.last_checked_at ? new Date(row.last_checked_at).getTime() : 0;
+      const fifteenMins = 15 * 60 * 1000;
+      
+      // If stale (>15 mins old) or empty, force a live API call
+      if (Date.now() - lastCheck > fifteenMins) {
+        console.log(`⚡️ Live Refreshing: ${row.awb}`);
+        const fresh = await forceRefreshShipment(row.awb, row.courier_source);
+        if (fresh) {
+           // Overlay fresh data onto the current row for the response
+           row.last_state = resolveShipmentState(fresh.status);
+           row.last_status = fresh.status;
+           row.db_history = fresh.history;
+        }
+      }
+      return row;
+    });
+
+    const refreshedRows = await Promise.all(promises);
+
+    // 3. Format Response
+    const results = refreshedRows.map((row) => {
       let history = [{ status: "Ordered", date: new Date(row.created_at).toDateString(), completed: true }];
       if (row.fulfillment_status === 'fulfilled') history.push({ status: "Dispatched", date: "Order Packed", completed: true });
       if (Array.isArray(row.db_history)) history = [...history, ...row.db_history];
 
       return { 
-        shopify_order_name: row.order_number, awb: row.awb, 
+        shopify_order_name: row.order_number, 
+        awb: row.awb, 
         current_state: row.last_state || (row.fulfillment_status === 'fulfilled' ? "IN_TRANSIT" : "PROCESSING"), 
         courier: row.courier_source, 
         last_known_status: row.last_status || "Shipment information will be updated shortly", 
         tracking_history: history 
       };
     });
+
     res.json({ orders: results });
   } catch (e) { 
     console.error("Tracking Error:", e.message);
@@ -281,26 +374,13 @@ app.post("/edd", async (req, res) => {
 });
 
 /* ===============================
-   🔔 WEBHOOKS & ADMIN
+   📊 ADMIN DASHBOARD
 ================================ */
-app.post("/webhooks/orders_paid", (req, res) => { res.sendStatus(200); if (verifyShopify(req)) syncOrder(req.body); });
-app.post("/webhooks/fulfillments_create", async (req, res) => {
-  res.sendStatus(200); if (!verifyShopify(req) || !req.body.tracking_number) return;
-  const courier = req.body.tracking_company?.toLowerCase().includes("blue") ? "bluedart" : "shiprocket";
-  await pool.query(`INSERT INTO shipments_ops (awb, order_id, courier_source) VALUES ($1,$2,$3) ON CONFLICT (awb) DO NOTHING`, [req.body.tracking_number, String(req.body.order_id), courier]);
-});
-app.post("/webhooks/returnprime", async (req, res) => {
-  res.sendStatus(200); const e = req.body;
-  if (!e.id || !e.order_number) return;
-  await pool.query(`INSERT INTO returns_ops (return_id, order_number, status, updated_at) VALUES ($1,$2,$3,NOW()) ON CONFLICT (return_id) DO UPDATE SET status=EXCLUDED.status, updated_at=NOW()`, [String(e.id), e.order_number, e.status || "created"]);
-});
-
 app.get("/ops/orders", async (req, res) => {
   if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
 
   try {
-    // 🟢 BUG FIX: Added '::text' to JOIN conditions.
-    // This prevents "operator does not exist: bigint = text" errors.
+    // 🟢 BUG FIX: Added '::text' to JOIN conditions (Crash Proof)
     const { rows } = await pool.query(`
       SELECT o.*, s.awb, s.last_state, r.status AS return_status 
       FROM orders_ops o 
