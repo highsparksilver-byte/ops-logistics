@@ -42,7 +42,7 @@ async function logEvent(level, module, message, meta = {}) {
   if (level === 'ERROR') console.error(`❌ ${logMsg}`, meta);
   else console.log(`✅ ${logMsg}`);
 
-  // Fire-and-forget write to DB (don't await to avoid slowing down response)
+  // Fire-and-forget write to DB
   pool.query(
     `INSERT INTO system_logs (level, module, message, meta) VALUES ($1, $2, $3, $4)`,
     [level, module, message, JSON.stringify(meta)]
@@ -50,7 +50,7 @@ async function logEvent(level, module, message, meta = {}) {
 }
 
 /* ===============================
-   🔐 SECURITY & HELPERS)
+   🔐 SECURITY & HELPERS
 ================================ */
 function verifyShopify(req) {
   const secret = clean(SHOPIFY_WEBHOOK_SECRET);
@@ -106,82 +106,20 @@ function formatConfidenceBand(dStr) {
 ================================ */
 let srJwt, srAt = 0, bdJwt, bdAt = 0;
 
-async function trackBluedart(awb) {
+async function getBluedartJwt() { 
+  if (bdJwt && Date.now() - bdAt < 23 * 3600000) return bdJwt; 
   try {
-    const r = await axios.get("https://api.bluedart.com/servlet/RoutingServlet", {
-      params: { 
-        handler: "tnt", 
-        action: "custawbquery", 
-        loginid: clean(LOGIN_ID), 
-        awb: "awb", 
-        numbers: awb, 
-        format: "xml", 
-        lickey: clean(BD_LICENCE_KEY_TRACK), 
-        verno: 1, 
-        scan: 1 
-      },
-      responseType: "text"
-    });
-    
-    if (!r.data || r.data.trim().startsWith("<html")) {
-      logEvent('ERROR', 'TRACKING', `BlueDart HTML/Error Response`, { awb });
-      return null;
-    }
-    const p = await xml2js.parseStringPromise(r.data, { explicitArray: false });
-    const s = p?.ShipmentData?.Shipment; 
-    if (!s) { logEvent('WARN', 'TRACKING', `BlueDart Empty Data`, { awb }); return null; }
-
-    const isFinal = s.Status?.toUpperCase().includes("DELIVERED");
-    const rawScans = Array.isArray(s.Scans?.ScanDetail) ? s.Scans.ScanDetail : [s.Scans?.ScanDetail];
-    
-    const scans = rawScans.filter(x => {
-      if (!x?.Scan) return false;
-      if (isFinal) return true; 
-      return !IGNORE_SCANS.some(k => x.Scan.toUpperCase().includes(k));
-    });
-
-    return { 
-      status: s.Status, 
-      delivered: isFinal, 
-      // 🟢 SAFETY FIX: Ensure dates are always valid strings
-      history: scans.map(x => {
-        const date = x.ScanDate ? x.ScanDate.trim() : "";
-        const time = x.ScanTime ? x.ScanTime.trim() : "00:00";
-        return { 
-          status: x.Scan, 
-          date: (date && time) ? `${date} ${time}` : new Date().toDateString(), 
-          location: x.ScannedLocation 
-        };
-      }),
-      raw: p 
-    };
-  } catch (e) { logEvent('ERROR', 'TRACKING', `BlueDart Exception`, { awb, error: e.message }); return null; }
+    const r = await axios.get("https://apigateway.bluedart.com/in/transportation/token/v1/login", { headers: { ClientID: clean(CLIENT_ID), clientSecret: clean(CLIENT_SECRET) } });
+    bdJwt = r.data.JWTToken; bdAt = Date.now(); return bdJwt; 
+  } catch (e) { logEvent('ERROR', 'AUTH', 'BlueDart Auth Failed', { error: e.message }); return null; }
 }
 
-async function trackShiprocket(awb) {
+async function getShiprocketJwt() {
+  if (srJwt && Date.now() - srAt < 7 * 86400000) return srJwt;
   try {
-    const t = await getShiprocketJwt();
-    if (!t) return null;
-    const r = await axios.get(`https://apiv2.shiprocket.in/v1/external/courier/track/awb/${awb}`, { headers: { Authorization: `Bearer ${t}` } });
-    const d = r.data?.tracking_data; 
-    
-    if (!d) { logEvent('WARN', 'TRACKING', `Shiprocket Empty Data`, { awb, response: r.data }); return null; }
-    
-    // 🟢 SAFETY FIX: Check both main status AND internal array status
-    const status = d.current_status || d.shipment_track?.[0]?.current_status || "";
-
-    return { 
-      status: status, 
-      delivered: status.toUpperCase().includes("DELIVERED"), 
-      history: (d.shipment_track_activities || []).map(x => ({ status: x.activity, date: x.date, location: x.location })), 
-      raw: d 
-    };
-  } catch (e) { 
-    // 🟢 SAFETY FIX: Detailed error logging
-    const errMsg = e.response?.data ? JSON.stringify(e.response.data) : e.message;
-    logEvent('ERROR', 'TRACKING', `Shiprocket API Error`, { awb, error: errMsg }); 
-    return null; 
-  }
+    const r = await axios.post("https://apiv2.shiprocket.in/v1/external/auth/login", { email: clean(SHIPROCKET_EMAIL), password: clean(SHIPROCKET_PASSWORD) });
+    srJwt = r.data.token; srAt = Date.now(); return srJwt;
+  } catch (e) { logEvent('ERROR', 'AUTH', 'Shiprocket Auth Failed', { error: e.response?.data || e.message }); return null; }
 }
 
 const IGNORE_SCANS = ["BAGGED", "MANIFEST", "NETWORK", "RELIEF", "PARTIAL"];
@@ -376,6 +314,7 @@ app.post("/track/customer", async (req, res) => {
 
   try {
     const cleanInput = req.body.phone.toString().replace(/\D/g, "").slice(-10);
+    // 🟢 BUG FIX: Added '::text' casting
     const { rows } = await pool.query(`SELECT o.order_number, o.created_at, o.fulfillment_status, s.awb, s.courier_source, s.last_state, s.last_status, s.history as db_history, s.last_checked_at FROM orders_ops o LEFT JOIN shipments_ops s ON s.order_id::text = o.id::text WHERE o.customer_phone::text LIKE $1 ORDER BY o.created_at DESC LIMIT 5`, [`%${cleanInput}`]);
 
     const promises = rows.map(async (row) => {
@@ -430,6 +369,7 @@ app.post("/edd", async (req, res) => { /* EDD Logic same as before */
 app.get("/ops/orders", async (req, res) => {
   if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
   try {
+    // 🟢 BUG FIX: Added '::text' to JOIN conditions (Crash Proof)
     const { rows } = await pool.query(`SELECT o.*, s.awb, s.last_state, r.status AS return_status FROM orders_ops o LEFT JOIN shipments_ops s ON s.order_id::text = o.id::text LEFT JOIN returns_ops r ON r.order_number::text = o.order_number::text ORDER BY o.created_at DESC LIMIT 100`);
     res.json({ orders: rows });
   } catch (e) { res.status(500).json({ error: "Db Error: " + e.message }); }
