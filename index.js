@@ -431,7 +431,7 @@ app.post("/track/customer", async (req, res) => {
 });
 
 /* ===============================
-   ✅ UPDATED: PAGINATED ORDERS ENDPOINT (FINAL)
+   ✅ UPDATED: PAGINATED ORDERS ENDPOINT (CRASH PROOF)
 ================================ */
 app.get("/ops/orders", async (req, res) => {
   if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
@@ -443,40 +443,60 @@ app.get("/ops/orders", async (req, res) => {
 
     const query = `
       SELECT 
+        o.id,
         o.order_number,
         o.created_at,
         o.financial_status,
         o.fulfillment_status,
         o.total_price,
+        o.payment_gateway_names,
         o.line_items,
+        o.is_exchange,
+        o.is_return,
+        o.source,
         
-        -- Smart Customer Fallbacks
+        -- Smart Customer Info
         COALESCE(o.customer_name, s.raw_data->'shipment_track'->0->>'consignee_name', 'Guest') as customer_name,
         COALESCE(o.customer_email, s.raw_data->'shipment_track'->0->>'email') as customer_email,
         COALESCE(o.customer_phone, s.raw_data->'shipment_track'->0->>'mobile') as customer_phone,
         
         -- Address Logic
+        COALESCE(o.city, s.raw_data->'shipment_track'->0->>'destination') as city,
         COALESCE(
-           CONCAT(o.shipping_address->>'address1', ', ', o.shipping_address->>'city', ' - ', o.shipping_address->>'zip'),
+           CONCAT(o.shipping_address->>'address1', ', ', o.shipping_address->>'address2', ', ', o.shipping_address->>'city', ' - ', o.shipping_address->>'zip'),
+           CONCAT(s.raw_data->'shipment_track'->0->>'destination', ' ', s.raw_data->'shipment_track'->0->>'location'),
            o.city
         ) as full_address,
 
-        -- Logistics
+        -- Shipment Core
         s.awb, 
         s.courier_source,
+        s.last_state, 
         s.last_status,
         
-        -- NDR Reason & Dates from Shiprocket/BD JSON
-        (
-          SELECT activity FROM jsonb_to_recordset(s.raw_data->'shipment_track_activities') 
-          as x(activity text, "sr-status" text)
-          WHERE "sr-status" IN ('6', '13', '14', '19', '20', '21') LIMIT 1
-        ) as ndr_reason,
+        -- Dates
         s.raw_data->'shipment_track'->0->>'delivered_date' as delivered_date,
-        s.raw_data->'shipment_track'->0->>'edd' as expected_delivery_date
+        s.raw_data->'shipment_track'->0->>'edd' as expected_delivery_date,
+
+        -- 🟢 CRASH FIX: Check if data is array before expanding
+        (
+          SELECT activity 
+          FROM jsonb_to_recordset(
+            CASE 
+              WHEN jsonb_typeof(s.raw_data->'shipment_track_activities') = 'array' 
+              THEN s.raw_data->'shipment_track_activities' 
+              ELSE '[]'::jsonb 
+            END
+          ) as x(activity text, "sr-status" text)
+          WHERE "sr-status" IN ('6', '13', '14', '19', '20', '21', '53', '54', '55', '56') 
+          LIMIT 1
+        ) as ndr_reason,
+
+        r.status AS return_status 
 
       FROM orders_ops o 
       LEFT JOIN shipments_ops s ON s.order_id::text = o.id::text 
+      LEFT JOIN returns_ops r ON r.order_number::text = o.order_number::text 
       ORDER BY o.created_at DESC 
       LIMIT $1 OFFSET $2
     `;
@@ -492,7 +512,9 @@ app.get("/ops/orders", async (req, res) => {
         totalPages: Math.ceil(parseInt(countRes.rows[0].count) / limit)
       }
     });
+
   } catch (e) { 
+    console.error(e); // Log error to Render console for deeper debugging
     res.status(500).json({ error: "Db Error: " + e.message }); 
   }
 });
