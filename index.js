@@ -16,7 +16,19 @@ axios.defaults.timeout = 25000;
 app.use(express.json({ limit: "2mb", verify: (req, res, buf) => { req.rawBody = buf.toString(); } }));
 
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  const allowedOrigins = [
+    "https://your-new-vercel-app.vercel.app", // 👈 Add your Vercel URL here
+    "http://localhost:3000"
+  ];
+  const origin = req.headers.origin;
+  
+  if (allowedOrigins.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  } else {
+    // Optional: Allow all during testing (less secure)
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  }
+  
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-admin-key");
   if (req.method === "OPTIONS") return res.sendStatus(200);
