@@ -518,6 +518,35 @@ app.get("/ops/orders", async (req, res) => {
     res.status(500).json({ error: "Db Error: " + e.message }); 
   }
 });
+/* ===============================
+   🚀 TEMP: LOGISTICS REFRESHER
+================================ */
+app.get("/ops/refresh-logistics", async (req, res) => {
+  if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
+
+  try {
+    // 1. Get all shipments that are not delivered and were checked more than 1 hour ago
+    const { rows } = await pool.query(`
+      SELECT awb, courier_source 
+      FROM shipments_ops 
+      WHERE delivered = FALSE 
+      LIMIT 100
+    `);
+
+    logEvent('INFO', 'RECOVERY', `Found ${rows.length} shipments to refresh.`);
+
+    // 2. Loop through and force refresh
+    for (const r of rows) {
+      await forceRefreshShipment(r.awb, r.courier_source);
+      // Small delay to avoid Shiprocket rate limits
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+
+    res.json({ message: `Successfully queued refresh for ${rows.length} shipments.` });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 /* ===============================
    📊 ADMIN DASHBOARD & LOGS
