@@ -297,8 +297,23 @@ app.post("/webhooks/returnprime", async (req, res) => {
 
 app.get("/ops/orders", async (req, res) => {
   if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
-  const { rows } = await pool.query(`SELECT o.*, s.awb, s.last_state, r.status AS return_status FROM orders_ops o LEFT JOIN shipments_ops s ON s.order_id = o.id LEFT JOIN returns_ops r ON r.order_number = o.order_number ORDER BY o.created_at DESC LIMIT 100`);
-  res.json({ orders: rows });
+
+  try {
+    // 🟢 BUG FIX: Added '::text' to JOIN conditions.
+    // This prevents "operator does not exist: bigint = text" errors.
+    const { rows } = await pool.query(`
+      SELECT o.*, s.awb, s.last_state, r.status AS return_status 
+      FROM orders_ops o 
+      LEFT JOIN shipments_ops s ON s.order_id::text = o.id::text 
+      LEFT JOIN returns_ops r ON r.order_number::text = o.order_number::text 
+      ORDER BY o.created_at DESC 
+      LIMIT 100
+    `);
+    res.json({ orders: rows });
+  } catch (e) {
+    console.error("Dashboard Error:", e.message);
+    res.status(500).json({ error: "Db Error: " + e.message });
+  }
 });
 
 app.get("/recon/ops", async (req, res) => {
