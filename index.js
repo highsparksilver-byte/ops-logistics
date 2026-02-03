@@ -8,9 +8,9 @@ import crypto from "crypto";
    🚀 APP INIT & CONFIG
 ================================ */
 const app = express();
-const eddCache = new Map(); // 🟢 ADDED THIS (Prevents Crash)
+const eddCache = new Map(); // ✅ Cache Init
 const rateLimiter = new Map();
-axios.defaults.timeout = 25000; // 25s timeout for couriers
+axios.defaults.timeout = 25000;
 
 // 🟢 Capture Raw Body for Webhook Verification
 app.use(express.json({ limit: "2mb", verify: (req, res, buf) => { req.rawBody = buf.toString(); } }));
@@ -35,15 +35,28 @@ const { Pool } = pg;
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
 /* ===============================
-   📝 SYSTEM LOGGER (DB-BASED)
+   🕒 DATE HELPERS (THE MISSING PIECE)
+================================ */
+function nowIST() {
+  const d = new Date();
+  return new Date(d.getTime() + (330 + d.getTimezoneOffset()) * 60000);
+}
+
+function getNextWorkingDate() {
+  const d = nowIST();
+  // If today is Sunday, move pickup to Monday
+  if (d.getDay() === 0) d.setDate(d.getDate() + 1); 
+  return `/Date(${d.getTime()})/`; // 👈 The specific format BlueDart needs
+}
+
+/* ===============================
+   📝 SYSTEM LOGGER
 ================================ */
 async function logEvent(level, module, message, meta = {}) {
-  // Always print to console for Render logs
   const logMsg = `[${module}] ${message}`;
   if (level === 'ERROR') console.error(`❌ ${logMsg}`, meta);
   else console.log(`✅ ${logMsg}`);
 
-  // Fire-and-forget write to DB
   pool.query(
     `INSERT INTO system_logs (level, module, message, meta) VALUES ($1, $2, $3, $4)`,
     [level, module, message, JSON.stringify(meta)]
@@ -61,9 +74,7 @@ function verifyShopify(req) {
   }
   const digest = crypto.createHmac("sha256", secret).update(req.rawBody).digest("base64");
   const received = req.headers["x-shopify-hmac-sha256"];
-  
   if (digest === received) return true;
-  
   logEvent('ERROR', 'WEBHOOK', 'Signature Mismatch', { expected: digest, received });
   return false;
 }
@@ -133,17 +144,7 @@ const IGNORE_SCANS = ["BAGGED", "MANIFEST", "NETWORK", "RELIEF", "PARTIAL"];
 async function trackBluedart(awb) {
   try {
     const r = await axios.get("https://api.bluedart.com/servlet/RoutingServlet", {
-      params: { 
-        handler: "tnt", 
-        action: "custawbquery", 
-        loginid: clean(LOGIN_ID), 
-        awb: "awb", 
-        numbers: awb, 
-        format: "xml", 
-        lickey: clean(BD_LICENCE_KEY_TRACK), 
-        verno: 1, 
-        scan: 1 
-      },
+      params: { handler: "tnt", action: "custawbquery", loginid: clean(LOGIN_ID), awb: "awb", numbers: awb, format: "xml", lickey: clean(BD_LICENCE_KEY_TRACK), verno: 1, scan: 1 },
       responseType: "text"
     });
     
@@ -167,7 +168,6 @@ async function trackBluedart(awb) {
     return { 
       status: s.Status, 
       delivered: isFinal, 
-      // 🟢 SAFETY FIX: Ensure dates are always valid strings
       history: scans.map(x => {
         const date = x.ScanDate ? x.ScanDate.trim() : "";
         const time = x.ScanTime ? x.ScanTime.trim() : "00:00";
@@ -191,7 +191,6 @@ async function trackShiprocket(awb) {
     
     if (!d) { logEvent('WARN', 'TRACKING', `Shiprocket Empty Data`, { awb, response: r.data }); return null; }
     
-    // 🟢 SAFETY FIX: Check both main status AND internal array status
     const status = d.current_status || d.shipment_track?.[0]?.current_status || "";
 
     return { 
@@ -201,7 +200,6 @@ async function trackShiprocket(awb) {
       raw: d 
     };
   } catch (e) { 
-    // 🟢 SAFETY FIX: Detailed error logging
     const errMsg = e.response?.data ? JSON.stringify(e.response.data) : e.message;
     logEvent('ERROR', 'TRACKING', `Shiprocket API Error`, { awb, error: errMsg }); 
     return null; 
@@ -209,7 +207,28 @@ async function trackShiprocket(awb) {
 }
 
 async function getCity(p){try{const r=await axios.get(`https://api.postalpincode.in/pincode/${p}`);return r.data?.[0]?.PostOffice?.[0]?.District||null}catch{return null}}
-async function predictBluedartEDD(p){try{const j=await getBluedartJwt();if(!j)return null;const r=await axios.post("https://apigateway.bluedart.com/in/transportation/transit/v1/GetDomesticTransitTimeForPinCodeandProduct",{pPinCodeFrom:"411022",pPinCodeTo:p,pProductCode:"A",pSubProductCode:"P",pPudate:new Date(new Date().getTime()+330*60000).toISOString(),pPickupTime:"16:00",profile:{Api_type:"S",LicenceKey:clean(BD_LICENCE_KEY_EDD),LoginID:clean(LOGIN_ID)}},{headers:{JWTToken:j}});return r.data?.GetDomesticTransitTimeForPinCodeandProductResult?.ExpectedDateDelivery||null}catch{return null}}
+
+// 🟢 PREDICT BLUEDART EDD (Fixed Date Format)
+async function predictBluedartEDD(p) {
+  try {
+    const j = await getBluedartJwt();
+    if (!j) return null;
+    const r = await axios.post("https://apigateway.bluedart.com/in/transportation/transit/v1/GetDomesticTransitTimeForPinCodeandProduct", {
+      pPinCodeFrom: "411022",
+      pPinCodeTo: p,
+      pProductCode: "A",
+      pSubProductCode: "P",
+      pPudate: getNextWorkingDate(), // ✅ Uses correct format now
+      pPickupTime: "16:00",
+      profile: { Api_type: "S", LicenceKey: clean(BD_LICENCE_KEY_EDD), LoginID: clean(LOGIN_ID) }
+    }, { headers: { JWTToken: j } });
+    return r.data?.GetDomesticTransitTimeForPinCodeandProductResult?.ExpectedDateDelivery || null;
+  } catch (e) { 
+    logEvent('ERROR', 'EDD', `BlueDart EDD Error`, { error: e.message });
+    return null; 
+  }
+}
+
 async function predictShiprocketEDD(p){try{const t=await getShiprocketJwt();if(!t)return null;const r=await axios.get(`https://apiv2.shiprocket.in/v1/external/courier/serviceability/?pickup_postcode=411022&delivery_postcode=${p}&cod=1&weight=0.5`,{headers:{Authorization:`Bearer ${t}`}});return r.data?.data?.available_courier_companies?.[0]?.etd||null}catch{return null}}
 
 /* ===============================
@@ -240,11 +259,11 @@ async function updateStaleShipments() {
       const t = r.courier_source === "bluedart" ? await trackBluedart(r.awb) : await trackShiprocket(r.awb);
       
       if (t) {
-        // ✅ Success: Update Status & Timestamp
+        // ✅ Success
         await pool.query(`UPDATE shipments_ops SET delivered=$1, last_status=$2, last_state=$3, history=$4::jsonb, raw_data=$5::jsonb, last_checked_at=NOW() WHERE awb=$6`, 
         [t.delivered, t.status, resolveShipmentState(t.status), JSON.stringify(t.history || []), JSON.stringify(t.raw || {}), r.awb]);
       } else {
-        // ⚠️ Failure: "Touch" the row so we don't get stuck on it forever
+        // ⚠️ Failure
         console.log(`⚠️ Marking failed AWB as checked: ${r.awb}`);
         await pool.query(`UPDATE shipments_ops SET last_checked_at=NOW() WHERE awb=$1`, [r.awb]);
       }
@@ -327,7 +346,6 @@ app.post("/track/customer", async (req, res) => {
 
   try {
     const cleanInput = req.body.phone.toString().replace(/\D/g, "").slice(-10);
-    // 🟢 BUG FIX: Added '::text' casting
     const { rows } = await pool.query(`SELECT o.order_number, o.created_at, o.fulfillment_status, s.awb, s.courier_source, s.last_state, s.last_status, s.history as db_history, s.last_checked_at FROM orders_ops o LEFT JOIN shipments_ops s ON s.order_id::text = o.id::text WHERE o.customer_phone::text LIKE $1 ORDER BY o.created_at DESC LIMIT 5`, [`%${cleanInput}`]);
 
     const promises = rows.map(async (row) => {
@@ -374,18 +392,17 @@ app.post("/edd", async (req, res) => {
   const { pincode } = req.body;
   if (!/^\d{6}$/.test(pincode)) return res.json({ edd_display: null });
   
-  // Check Cache First
   if (eddCache.has(pincode)) return res.json(eddCache.get(pincode));
 
   const city = await getCity(pincode);
   
-  // 🟢 LOGIC UPDATE: Explicitly check BlueDart first, then Shiprocket
+  // 🟢 LOGIC: BlueDart First
   let rawDate = await predictBluedartEDD(pincode);
-  let source = "BlueDart"; // If this works, source is BlueDart
+  let source = "BlueDart"; 
 
   if (!rawDate) {
     rawDate = await predictShiprocketEDD(pincode);
-    source = "Shiprocket"; // If fallback runs, source is Shiprocket
+    source = "Shiprocket";
   }
   
   if (!rawDate) return res.json({ edd_display: null });
@@ -394,7 +411,7 @@ app.post("/edd", async (req, res) => {
     edd_display: formatConfidenceBand(rawDate), 
     city, 
     badge: city && ["MUMBAI","DELHI","BANGALORE","PUNE"].some(m=>city.toUpperCase().includes(m)) ? "METRO_EXPRESS" : "EXPRESS",
-    source: source // 🟢 NEW FIELD: Tells you exactly who gave the date
+    source: source 
   };
   
   eddCache.set(pincode, data);
@@ -404,7 +421,6 @@ app.post("/edd", async (req, res) => {
 app.get("/ops/orders", async (req, res) => {
   if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
   try {
-    // 🟢 BUG FIX: Added '::text' to JOIN conditions (Crash Proof)
     const { rows } = await pool.query(`SELECT o.*, s.awb, s.last_state, r.status AS return_status FROM orders_ops o LEFT JOIN shipments_ops s ON s.order_id::text = o.id::text LEFT JOIN returns_ops r ON r.order_number::text = o.order_number::text ORDER BY o.created_at DESC LIMIT 100`);
     res.json({ orders: rows });
   } catch (e) { res.status(500).json({ error: "Db Error: " + e.message }); }
