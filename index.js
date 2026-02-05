@@ -602,34 +602,36 @@ app.get("/recon/ops", async (req, res) => {
 });
 
 /* ===============================
-   🚚 EDD ENDPOINT (RESTORED)
+   🚚 EDD ENDPOINT (RESTORED GOLDEN LOGIC)
 ================================ */
 app.post("/edd", async (req, res) => {
   const { pincode } = req.body;
-  if (!pincode) return res.status(400).json({ error: "Pincode is required" });
+  if (!/^\d{6}$/.test(pincode)) return res.json({ edd_display: null });
+  
+  if (eddCache.has(pincode)) return res.json(eddCache.get(pincode));
 
-  if (eddCache.has(pincode)) return res.json({ ...eddCache.get(pincode), source: 'cache' });
+  const city = await getCity(pincode);
+  
+  // 🟢 LOGIC: BlueDart First
+  let rawDate = await predictBluedartEDD(pincode);
+  let source = "BlueDart"; 
 
-  try {
-    let edd = await predictBluedartEDD(pincode);
-    let source = "bluedart";
-
-    if (!edd) {
-      edd = await predictShiprocketEDD(pincode);
-      source = "shiprocket";
-    }
-
-    if (edd) {
-      const response = { pincode, edd, source };
-      eddCache.set(pincode, response);
-      res.json(response);
-    } else {
-      res.status(404).json({ error: "Serviceability not found" });
-    }
-  } catch (e) {
-    logEvent('ERROR', 'EDD', 'Endpoint Error', { error: e.message });
-    res.status(500).json({ error: "Internal Server Error" });
+  if (!rawDate) {
+    rawDate = await predictShiprocketEDD(pincode);
+    source = "Shiprocket";
   }
+  
+  if (!rawDate) return res.json({ edd_display: null });
+  
+  const data = { 
+    edd_display: formatConfidenceBand(rawDate), // ✅ Uses the helper function again
+    city, 
+    badge: city && ["MUMBAI","DELHI","BANGALORE","PUNE"].some(m=>city.toUpperCase().includes(m)) ? "METRO_EXPRESS" : "EXPRESS",
+    source: source 
+  };
+  
+  eddCache.set(pincode, data);
+  res.json(data);
 });
 
 app.get("/health", (_, res) => res.send("READY"));
