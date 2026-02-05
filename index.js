@@ -431,7 +431,7 @@ app.post("/track/customer", async (req, res) => {
 });
 
 /* ===============================
-   ✅ UPDATED: PAGINATED ORDERS ENDPOINT (CRASH PROOF1)
+   ✅ PAGINATED ORDERS ENDPOINT (CRASH PROOF1)
 ================================ */
 app.get("/ops/orders", async (req, res) => {
   if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
@@ -463,9 +463,9 @@ app.get("/ops/orders", async (req, res) => {
         -- Address Logic
         COALESCE(o.city, s.raw_data->'shipment_track'->0->>'destination') as city,
         COALESCE(
-           CONCAT(o.shipping_address->>'address1', ', ', o.shipping_address->>'address2', ', ', o.shipping_address->>'city', ' - ', o.shipping_address->>'zip'),
-           CONCAT(s.raw_data->'shipment_track'->0->>'destination', ' ', s.raw_data->'shipment_track'->0->>'location'),
-           o.city
+            CONCAT(o.shipping_address->>'address1', ', ', o.shipping_address->>'address2', ', ', o.shipping_address->>'city', ' - ', o.shipping_address->>'zip'),
+            CONCAT(s.raw_data->'shipment_track'->0->>'destination', ' ', s.raw_data->'shipment_track'->0->>'location'),
+            o.city
         ) as full_address,
 
         -- Shipment Core
@@ -563,6 +563,37 @@ app.get("/recon/ops", async (req, res) => {
   if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
   const { rows } = await pool.query(`SELECT COUNT(*) FILTER (WHERE is_exchange=FALSE AND is_return=FALSE) AS net_new_orders, COUNT(*) FILTER (WHERE is_return=TRUE) AS total_returns, COUNT(*) FILTER (WHERE financial_status!='paid' AND fulfillment_status='fulfilled') AS cod_at_risk FROM orders_ops WHERE created_at > NOW() - INTERVAL '30 days'`);
   res.json({ summary: rows[0] });
+});
+
+/* ===============================
+   🚚 EDD ENDPOINT (RESTORED)
+================================ */
+app.post("/edd", async (req, res) => {
+  const { pincode } = req.body;
+  if (!pincode) return res.status(400).json({ error: "Pincode is required" });
+
+  if (eddCache.has(pincode)) return res.json({ ...eddCache.get(pincode), source: 'cache' });
+
+  try {
+    let edd = await predictBluedartEDD(pincode);
+    let source = "bluedart";
+
+    if (!edd) {
+      edd = await predictShiprocketEDD(pincode);
+      source = "shiprocket";
+    }
+
+    if (edd) {
+      const response = { pincode, edd, source };
+      eddCache.set(pincode, response);
+      res.json(response);
+    } else {
+      res.status(404).json({ error: "Serviceability not found" });
+    }
+  } catch (e) {
+    logEvent('ERROR', 'EDD', 'Endpoint Error', { error: e.message });
+    res.status(500).json({ error: "Internal Server Error" });
+  }
 });
 
 app.get("/health", (_, res) => res.send("READY"));
