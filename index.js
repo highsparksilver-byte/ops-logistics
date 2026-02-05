@@ -203,10 +203,24 @@ async function trackShiprocket(awb) {
   try {
     const t = await getShiprocketJwt();
     if (!t) return null;
-    const r = await axios.get(`https://apiv2.shiprocket.in/v1/external/courier/track/awb/${awb}`, { headers: { Authorization: `Bearer ${t}` } });
-    const d = r.data?.tracking_data; 
     
-    if (!d) { logEvent('WARN', 'TRACKING', `Shiprocket Empty Data`, { awb, response: r.data }); return null; }
+    // We expect 200 OK, but Shiprocket sends 500/404 for cancelled AWBs sometimes
+    const r = await axios.get(`https://apiv2.shiprocket.in/v1/external/courier/track/awb/${awb}`, { 
+      headers: { Authorization: `Bearer ${t}` },
+      validateStatus: (status) => status < 600 // Allow 404/500 to be handled in code
+    });
+
+    // 🛡️ SPECIFIC FIX FOR "AWB CANCELLED"
+    const errorMsg = r.data?.message || JSON.stringify(r.data);
+    if (errorMsg.includes("cancelled") || errorMsg.includes("canceled")) {
+      return { status: "CANCELLED", delivered: false, history: [], raw: r.data };
+    }
+
+    const d = r.data?.tracking_data; 
+    if (!d) { 
+        logEvent('WARN', 'TRACKING', `Shiprocket Empty/Error`, { awb, response: r.data }); 
+        return null; 
+    }
     
     const status = d.current_status || d.shipment_track?.[0]?.current_status || "";
 
@@ -217,6 +231,7 @@ async function trackShiprocket(awb) {
       raw: d 
     };
   } catch (e) { 
+    // If it's a real network error, log it
     const errMsg = e.response?.data ? JSON.stringify(e.response.data) : e.message;
     logEvent('ERROR', 'TRACKING', `Shiprocket API Error`, { awb, error: errMsg }); 
     return null; 
@@ -306,17 +321,38 @@ async function syncOrder(o) {
 
 async function updateStaleShipments() {
   try {
-    const { rows } = await pool.query(`SELECT awb, courier_source FROM shipments_ops WHERE delivered = FALSE AND (last_checked_at IS NULL OR last_checked_at < NOW() - INTERVAL '30 minutes') LIMIT 15`);
+    const { rows } = await pool.query(`
+      SELECT awb, courier_source 
+      FROM shipments_ops 
+      WHERE delivered = FALSE 
+      AND (last_checked_at IS NULL OR last_checked_at < NOW() - INTERVAL '30 minutes') 
+      AND (last_status IS NULL OR last_status NOT LIKE '%CANCEL%') -- 🟢 Optimization: Don't check known cancelled
+      LIMIT 15
+    `);
     
     for (const r of rows) {
       const t = r.courier_source === "bluedart" ? await trackBluedart(r.awb) : await trackShiprocket(r.awb);
       
       if (t) {
-        // ✅ Success
-        await pool.query(`UPDATE shipments_ops SET delivered=$1, last_status=$2, last_state=$3, history=$4::jsonb, raw_data=$5::jsonb, last_checked_at=NOW() WHERE awb=$6`, 
+        // ✅ Success (Includes the new "CANCELLED" status from above)
+        await pool.query(`
+          UPDATE shipments_ops 
+          SET delivered=$1, 
+              last_status=$2, 
+              last_state=$3, 
+              history=$4::jsonb, 
+              raw_data=$5::jsonb, 
+              last_checked_at=NOW() 
+          WHERE awb=$6`, 
         [t.delivered, t.status, resolveShipmentState(t.status), JSON.stringify(t.history || []), JSON.stringify(t.raw || {}), r.awb]);
+        
+        // Log if we killed a zombie
+        if (t.status === "CANCELLED") {
+             logEvent('INFO', 'CLEANUP', `Marked AWB ${r.awb} as CANCELLED (Stopped Loop)`);
+        }
+
       } else {
-        // ⚠️ Failure
+        // ⚠️ Failure (Network error / Socket Hangup)
         console.log(`⚠️ Marking failed AWB as checked: ${r.awb}`);
         await pool.query(`UPDATE shipments_ops SET last_checked_at=NOW() WHERE awb=$1`, [r.awb]);
       }
