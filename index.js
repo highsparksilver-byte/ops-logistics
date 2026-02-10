@@ -3,12 +3,13 @@ import axios from "axios";
 import xml2js from "xml2js";
 import pg from "pg";
 import crypto from "crypto";
+import cron from "node-cron"; // ✅ Ensure node-cron is imported
 
 /* ===============================
    🚀 APP INIT & CONFIG
 ================================ */
 const app = express();
-const eddCache = new Map(); // ✅ Cache Init
+const eddCache = new Map(); 
 const rateLimiter = new Map();
 axios.defaults.timeout = 25000;
 
@@ -318,7 +319,6 @@ async function syncOrder(o) {
 // 🟢 TURBO WATCHDOG
 async function updateStaleShipments() {
   try {
-    // INCREASED LIMIT TO 50 per batch
     const { rows } = await pool.query(`
       SELECT awb, courier_source 
       FROM shipments_ops 
@@ -366,9 +366,38 @@ async function runBackfill() {
   } catch (e) { logEvent('ERROR', 'BACKFILL', 'Backfill Failed', { error: e.message }); }
 }
 
-setTimeout(runBackfill, 5000);
-// 🟢 INCREASED FREQUENCY: Every 10 mins (Instead of 30)
+// 🟢 NEW: SAFETY NET (CATCH MISSED CANCELLATIONS)
+async function runSafetyNet() {
+  if (!SHOPIFY_ACCESS_TOKEN || !SHOP_NAME) return;
+  
+  // Calculate date 10 days ago
+  const d = new Date();
+  d.setDate(d.getDate() - 10);
+  const minDate = d.toISOString();
+  
+  try {
+    logEvent('INFO', 'SAFETY_NET', `Scanning orders updated since ${minDate}...`);
+    const url = `https://${clean(SHOP_NAME)}.myshopify.com/admin/api/${API_VER}/orders.json?status=any&limit=250&updated_at_min=${minDate}`;
+    const r = await axios.get(url, { headers: { "X-Shopify-Access-Token": clean(SHOPIFY_ACCESS_TOKEN) } });
+    
+    const orders = r.data.orders || [];
+    for (const o of orders) await syncOrder(o);
+    
+    logEvent('INFO', 'SAFETY_NET', `Safety Sync Complete: Updated ${orders.length} orders.`);
+  } catch (e) {
+    logEvent('ERROR', 'SAFETY_NET', 'Safety Net Failed', { error: e.message });
+  }
+}
+
+// ⏲️ CRON SCHEDULES
+setTimeout(runBackfill, 5000); // Run once on startup
+// 1. Regular Backfill & Watchdog (Every 10 mins)
 setInterval(() => { runBackfill(); updateStaleShipments(); }, 10 * 60 * 1000);
+
+// 2. Safety Net: Every 12 Hours (0 */12 * * *)
+cron.schedule('0 */12 * * *', async () => {
+    await runSafetyNet();
+});
 
 /* ===============================
    ⚡️ INSTANT SYNC HELPER
@@ -569,6 +598,33 @@ app.get("/admin/force-single", async (req, res) => {
     const result = await forceRefreshShipment(awb, r.rows[0].courier_source);
     res.json({ success: !!result, data: result });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* ===============================
+   🚀 NEW: DEEP SYNC ENDPOINT
+================================ */
+app.get("/admin/deep-sync", async (req, res) => {
+  if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
+
+  try {
+    const d = new Date();
+    d.setDate(d.getDate() - 15); // Sync last 15 days
+    const minDate = d.toISOString();
+
+    logEvent('INFO', 'DEEP_SYNC', `Fetching orders updated since ${minDate}...`);
+    const url = `https://${clean(SHOP_NAME)}.myshopify.com/admin/api/${API_VER}/orders.json?status=any&limit=250&updated_at_min=${minDate}`;
+    
+    const r = await axios.get(url, { headers: { "X-Shopify-Access-Token": clean(SHOPIFY_ACCESS_TOKEN) } });
+    const orders = r.data.orders || [];
+    
+    for (const o of orders) await syncOrder(o);
+
+    logEvent('INFO', 'DEEP_SYNC', `Successfully synced ${orders.length} orders.`);
+    res.json({ success: true, count: orders.length });
+  } catch (e) {
+    logEvent('ERROR', 'DEEP_SYNC', 'Failed', { error: e.message });
+    res.status(500).json({ error: e.message });
+  }
 });
 
 /* ===============================
