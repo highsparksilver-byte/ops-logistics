@@ -601,26 +601,45 @@ app.get("/admin/force-single", async (req, res) => {
 });
 
 /* ===============================
-   🚀 NEW: DEEP SYNC ENDPOINT
+   🚀 DEEP SYNC (Pagination Support: Up to 1000 orders)
 ================================ */
 app.get("/admin/deep-sync", async (req, res) => {
   if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
 
   try {
     const d = new Date();
-    d.setDate(d.getDate() - 15); // Sync last 15 days
+    d.setDate(d.getDate() - 20); // Sync last 20 days
     const minDate = d.toISOString();
 
-    logEvent('INFO', 'DEEP_SYNC', `Fetching orders updated since ${minDate}...`);
-    const url = `https://${clean(SHOP_NAME)}.myshopify.com/admin/api/${API_VER}/orders.json?status=any&limit=250&updated_at_min=${minDate}`;
-    
-    const r = await axios.get(url, { headers: { "X-Shopify-Access-Token": clean(SHOPIFY_ACCESS_TOKEN) } });
-    const orders = r.data.orders || [];
-    
-    for (const o of orders) await syncOrder(o);
+    logEvent('INFO', 'DEEP_SYNC', `Starting Deep Sync from ${minDate}...`);
 
-    logEvent('INFO', 'DEEP_SYNC', `Successfully synced ${orders.length} orders.`);
-    res.json({ success: true, count: orders.length });
+    let url = `https://${clean(SHOP_NAME)}.myshopify.com/admin/api/${API_VER}/orders.json?status=any&limit=250&updated_at_min=${minDate}`;
+    let totalSynced = 0;
+
+    // 🟢 PAGINATION LOOP: Keep fetching until we hit 1000 or run out
+    while (url && totalSynced < 1000) {
+       const r = await axios.get(url, { headers: { "X-Shopify-Access-Token": clean(SHOPIFY_ACCESS_TOKEN) } });
+       const orders = r.data.orders || [];
+       
+       if (orders.length === 0) break;
+
+       for (const o of orders) await syncOrder(o);
+       
+       totalSynced += orders.length;
+       
+       // 🟢 CHECK FOR NEXT PAGE (Cursor Pagination)
+       const linkHeader = r.headers.link || r.headers['link']; // Handle case sensitivity
+       if (linkHeader && linkHeader.includes('rel="next"')) {
+           const match = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
+           url = match ? match[1] : null;
+       } else {
+           url = null; // No more pages
+       }
+    }
+
+    logEvent('INFO', 'DEEP_SYNC', `Deep Sync Complete. Total Orders: ${totalSynced}`);
+    res.json({ success: true, count: totalSynced, message: `Synced ${totalSynced} orders.` });
+
   } catch (e) {
     logEvent('ERROR', 'DEEP_SYNC', 'Failed', { error: e.message });
     res.status(500).json({ error: e.message });
