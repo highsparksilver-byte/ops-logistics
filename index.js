@@ -45,11 +45,10 @@ const API_VER = clean(SHOPIFY_API_VERSION) || '2026-01';
 const { Pool } = pg;
 
 /* ===============================
-   🛠️ DB MIGRATION (Auto-Add Address Col)
+   🛠️ DB MIGRATION
 ================================ */
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
-// Run this once on startup to fix the table structure
 pool.query(`
   ALTER TABLE orders_ops 
   ADD COLUMN IF NOT EXISTS shipping_address JSONB;
@@ -240,7 +239,6 @@ async function trackShiprocket(awb) {
 
 async function getCity(p){try{const r=await axios.get(`https://api.postalpincode.in/pincode/${p}`);return r.data?.[0]?.PostOffice?.[0]?.District||null}catch{return null}}
 
-// 🟢 PREDICT BLUEDART EDD
 async function predictBluedartEDD(p) {
   try {
     const j = await getBluedartJwt();
@@ -267,7 +265,6 @@ async function predictShiprocketEDD(p){try{const t=await getShiprocketJwt();if(!
    🔄 SYNC & BACKGROUND
 ================================ */
 async function syncOrder(o) {
-  // Try to find phone in multiple places
   const phone = o.phone || o.customer?.phone || o.shipping_address?.phone || null;
   
   try {
@@ -282,7 +279,7 @@ async function syncOrder(o) {
         financial_status = EXCLUDED.financial_status, 
         fulfillment_status = EXCLUDED.fulfillment_status, 
         customer_phone = EXCLUDED.customer_phone, 
-        shipping_address = EXCLUDED.shipping_address, -- Update address if it changes
+        shipping_address = EXCLUDED.shipping_address, 
         city = EXCLUDED.city
     `, [
       String(o.id), 
@@ -295,7 +292,7 @@ async function syncOrder(o) {
       o.email || o.customer?.email, 
       phone, 
       o.shipping_address?.city, 
-      JSON.stringify(o.shipping_address || {}), // 🟢 SAVING FULL ADDRESS HERE
+      JSON.stringify(o.shipping_address || {}), 
       JSON.stringify(o.line_items || []), 
       o.name?.startsWith("EX-") || false, 
       o.name?.includes("-R") || false, 
@@ -303,7 +300,6 @@ async function syncOrder(o) {
       o.created_at
     ]);
     
-    // Sync Fulfillments
     if (o.fulfillments) {
       for (const f of o.fulfillments) {
         if (f.tracking_number) {
@@ -319,22 +315,25 @@ async function syncOrder(o) {
   }
 }
 
+// 🟢 TURBO WATCHDOG
 async function updateStaleShipments() {
   try {
+    // INCREASED LIMIT TO 50 per batch
     const { rows } = await pool.query(`
       SELECT awb, courier_source 
       FROM shipments_ops 
       WHERE delivered = FALSE 
       AND (last_checked_at IS NULL OR last_checked_at < NOW() - INTERVAL '30 minutes') 
-      AND (last_status IS NULL OR last_status NOT LIKE '%CANCEL%') -- 🟢 Optimization: Don't check known cancelled
-      LIMIT 15
+      AND (last_status IS NULL OR last_status NOT LIKE '%CANCEL%')
+      LIMIT 50
     `);
     
+    if (rows.length > 0) logEvent('INFO', 'WATCHDOG', `Checking ${rows.length} stale orders...`);
+
     for (const r of rows) {
       const t = r.courier_source === "bluedart" ? await trackBluedart(r.awb) : await trackShiprocket(r.awb);
       
       if (t) {
-        // ✅ Success (Includes the new "CANCELLED" status from above)
         await pool.query(`
           UPDATE shipments_ops 
           SET delivered=$1, 
@@ -346,16 +345,14 @@ async function updateStaleShipments() {
           WHERE awb=$6`, 
         [t.delivered, t.status, resolveShipmentState(t.status), JSON.stringify(t.history || []), JSON.stringify(t.raw || {}), r.awb]);
         
-        // Log if we killed a zombie
         if (t.status === "CANCELLED") {
              logEvent('INFO', 'CLEANUP', `Marked AWB ${r.awb} as CANCELLED (Stopped Loop)`);
         }
-
       } else {
-        // ⚠️ Failure (Network error / Socket Hangup)
-        console.log(`⚠️ Marking failed AWB as checked: ${r.awb}`);
         await pool.query(`UPDATE shipments_ops SET last_checked_at=NOW() WHERE awb=$1`, [r.awb]);
       }
+      // FAST SLEEP (500ms instead of 1.5s to speed up batch)
+      await new Promise(res => setTimeout(res, 500));
     }
   } catch (e) { logEvent('ERROR', 'SYNC', 'Stale Update Loop Failed', { error: e.message }); }
 }
@@ -370,7 +367,8 @@ async function runBackfill() {
 }
 
 setTimeout(runBackfill, 5000);
-setInterval(() => { runBackfill(); updateStaleShipments(); }, 30 * 60 * 1000);
+// 🟢 INCREASED FREQUENCY: Every 10 mins (Instead of 30)
+setInterval(() => { runBackfill(); updateStaleShipments(); }, 10 * 60 * 1000);
 
 /* ===============================
    ⚡️ INSTANT SYNC HELPER
@@ -467,7 +465,7 @@ app.post("/track/customer", async (req, res) => {
 });
 
 /* ===============================
-   ✅ PAGINATED ORDERS ENDPOINT (CRASH PROOF1)
+   ✅ PAGINATED ORDERS ENDPOINT
 ================================ */
 app.get("/ops/orders", async (req, res) => {
   if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
@@ -514,7 +512,7 @@ app.get("/ops/orders", async (req, res) => {
         s.raw_data->'shipment_track'->0->>'delivered_date' as delivered_date,
         s.raw_data->'shipment_track'->0->>'edd' as expected_delivery_date,
 
-        -- 🟢 CRASH FIX: Check if data is array before expanding
+        -- NDR Parsing
         (
           SELECT activity 
           FROM jsonb_to_recordset(
@@ -550,18 +548,36 @@ app.get("/ops/orders", async (req, res) => {
     });
 
   } catch (e) { 
-    console.error(e); // Log error to Render console for deeper debugging
+    console.error(e); 
     res.status(500).json({ error: "Db Error: " + e.message }); 
   }
 });
+
 /* ===============================
-   🚀 TEMP: LOGISTICS REFRESHER
+   🚀 NEW: FORCE SINGLE AWB
+================================ */
+app.get("/admin/force-single", async (req, res) => {
+  if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
+  const { awb } = req.query;
+  if (!awb) return res.status(400).json({ error: "AWB Required" });
+
+  try {
+    // Find courier source first
+    const r = await pool.query("SELECT courier_source FROM shipments_ops WHERE awb=$1", [awb]);
+    if (r.rows.length === 0) return res.status(404).json({ error: "AWB not in DB" });
+
+    const result = await forceRefreshShipment(awb, r.rows[0].courier_source);
+    res.json({ success: !!result, data: result });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* ===============================
+   🚀 LOGISTICS REFRESHER (BATCH)
 ================================ */
 app.get("/ops/refresh-logistics", async (req, res) => {
   if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
 
   try {
-    // 1. Get all shipments that are not delivered and were checked more than 1 hour ago
     const { rows } = await pool.query(`
       SELECT awb, courier_source 
       FROM shipments_ops 
@@ -571,10 +587,8 @@ app.get("/ops/refresh-logistics", async (req, res) => {
 
     logEvent('INFO', 'RECOVERY', `Found ${rows.length} shipments to refresh.`);
 
-    // 2. Loop through and force refresh
     for (const r of rows) {
       await forceRefreshShipment(r.awb, r.courier_source);
-      // Small delay to avoid Shiprocket rate limits
       await new Promise(resolve => setTimeout(resolve, 500));
     }
 
@@ -602,7 +616,7 @@ app.get("/recon/ops", async (req, res) => {
 });
 
 /* ===============================
-   🚚 EDD ENDPOINT (RESTORED GOLDEN LOGIC)
+   🚚 EDD ENDPOINT
 ================================ */
 app.post("/edd", async (req, res) => {
   const { pincode } = req.body;
@@ -612,7 +626,6 @@ app.post("/edd", async (req, res) => {
 
   const city = await getCity(pincode);
   
-  // 🟢 LOGIC: BlueDart First
   let rawDate = await predictBluedartEDD(pincode);
   let source = "BlueDart"; 
 
@@ -624,7 +637,7 @@ app.post("/edd", async (req, res) => {
   if (!rawDate) return res.json({ edd_display: null });
   
   const data = { 
-    edd_display: formatConfidenceBand(rawDate), // ✅ Uses the helper function again
+    edd_display: formatConfidenceBand(rawDate), 
     city, 
     badge: city && ["MUMBAI","DELHI","BANGALORE","PUNE"].some(m=>city.toUpperCase().includes(m)) ? "METRO_EXPRESS" : "EXPRESS",
     source: source 
