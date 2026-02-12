@@ -250,7 +250,7 @@ async function predictBluedartEDD(p) {
       pProductCode: "A",
       pSubProductCode: "P",
       pPudate: getNextWorkingDate(), 
-      pPickupTime: "16:00",
+      pPickupTime: "14:00", 
       profile: { Api_type: "S", LicenceKey: clean(BD_LICENCE_KEY_EDD), LoginID: clean(LOGIN_ID) }
     }, { headers: { JWTToken: j } });
     return r.data?.GetDomesticTransitTimeForPinCodeandProductResult?.ExpectedDateDelivery || null;
@@ -397,6 +397,16 @@ setInterval(() => { runBackfill(); updateStaleShipments(); }, 10 * 60 * 1000);
 // 2. Safety Net: Every 12 Hours (0 */12 * * *)
 cron.schedule('0 */12 * * *', async () => {
     await runSafetyNet();
+});
+
+// 3. Clear EDD Cache Daily at 14:10 IST
+cron.schedule('10 14 * * *', () => {
+    console.log("🧹 Clearing EDD Cache...");
+    eddCache.clear();
+    logEvent('INFO', 'CACHE', 'EDD Cache cleared automatically at 14:10');
+}, {
+    scheduled: true,
+    timezone: "Asia/Kolkata" // 👈 Vital: Ensures it runs at 2:10 PM India Time
 });
 
 /* ===============================
