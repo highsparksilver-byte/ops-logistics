@@ -50,6 +50,12 @@ const { Pool } = pg;
 ================================ */
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
+// Prevent app crash on idle client errors
+pool.on('error', (err, client) => {
+    console.error('❌ Unexpected error on idle client', err);
+    // Don't exit process, just log it. The pool will try to reconnect new clients.
+});
+
 pool.query(`
   ALTER TABLE orders_ops 
   ADD COLUMN IF NOT EXISTS shipping_address JSONB;
@@ -731,6 +737,13 @@ app.post("/edd", async (req, res) => {
   eddCache.set(pincode, data);
   res.json(data);
 });
+
+// 🧹 CLEANUP: Clear Rate Limiter every hour to prevent memory leaks
+setInterval(() => {
+    rateLimiter.clear();
+    // Optional: Log it if you want to verify it's working
+    // logEvent('INFO', 'SYSTEM', 'Rate Limiter flushed'); 
+}, 60 * 60 * 1000);
 
 app.get("/health", (_, res) => res.send("READY"));
 const PORT = process.env.PORT || 10000;
