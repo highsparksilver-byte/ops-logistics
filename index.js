@@ -334,15 +334,16 @@ async function syncOrder(o) {
   }
 }
 
-// 🟢 TURBO WATCHDOG
+// 🟢 TURBO WATCHDOG (FIXED: Queue Clogging & Null Traps)
 async function updateStaleShipments() {
   try {
+    // 1. FIXED SQL: Exclude RTOs so the queue doesn't get permanently choked
     const { rows } = await pool.query(`
       SELECT awb, courier_source 
       FROM shipments_ops 
       WHERE delivered = FALSE 
       AND (last_checked_at IS NULL OR last_checked_at < NOW() - INTERVAL '30 minutes') 
-      AND (last_status IS NULL OR last_status NOT LIKE '%CANCEL%')
+      AND (last_state IS NULL OR (last_state != 'RTO' AND last_state != 'CANCELLED'))
       LIMIT 50
     `);
     
@@ -367,9 +368,13 @@ async function updateStaleShipments() {
              logEvent('INFO', 'CLEANUP', `Marked AWB ${r.awb} as CANCELLED (Stopped Loop)`);
         }
       } else {
+        // 2. THE NULL TRAP: If it fails, bump the timer. 
+        // Note: If an AWB is older than 15 days and still returning null, you may want to manually void it in the DB.
         await pool.query(`UPDATE shipments_ops SET last_checked_at=NOW() WHERE awb=$1`, [r.awb]);
+        logEvent('WARN', 'WATCHDOG', `API returned null for AWB ${r.awb}. Bumping timer.`);
       }
-      // FAST SLEEP (500ms instead of 1.5s to speed up batch)
+      
+      // FAST SLEEP
       await new Promise(res => setTimeout(res, 500));
     }
   } catch (e) { logEvent('ERROR', 'SYNC', 'Stale Update Loop Failed', { error: e.message }); }
