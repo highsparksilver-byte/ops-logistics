@@ -446,7 +446,7 @@ async function syncOrder(o) {
   }
 }
 
-// 🟢 UPGRADED: Smart Polling (Normal = 30 mins, RTO = 24 hours to save API calls)
+// 🟢 UPGRADED: Added ORDER BY to cycle through the oldest unchecked packages first
 async function updateStaleShipments() {
   try {
     const { rows } = await pool.query(`
@@ -455,12 +455,11 @@ async function updateStaleShipments() {
       WHERE delivered = FALSE 
       AND (last_status IS NULL OR last_status NOT LIKE '%CANCEL%')
       AND (
-        -- Rule 1: Normal shipments checked every 30 minutes
         (COALESCE(last_state, '') != 'RTO' AND (last_checked_at IS NULL OR last_checked_at < NOW() - INTERVAL '30 minutes'))
         OR 
-        -- Rule 2: RTO shipments only checked every 24 hours
         (last_state = 'RTO' AND last_checked_at < NOW() - INTERVAL '24 hours')
       )
+      ORDER BY last_checked_at ASC NULLS FIRST
       LIMIT 50
     `);
     
