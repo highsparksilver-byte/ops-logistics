@@ -475,21 +475,17 @@ app.post("/track/customer", async (req, res) => {
   const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
   if (!checkRateLimit(ip)) return res.status(429).json({ error: "Too many requests" });
   
-  // 1. Accept either tracking_id, awb, or phone
   const input = req.body?.tracking_id || req.body?.awb || req.body?.phone; 
   if (!input) return res.status(400).json({ error: "Tracking ID required" });
 
   try {
-    // 2. Keep letters and numbers for AWB matching
     const cleanInput = input.toString().trim().replace(/[^a-zA-Z0-9-]/g, ""); 
-    
-    // 3. Extract just the numbers for phone matching (fallback)
     const phoneMatch = cleanInput.replace(/\D/g, "").slice(-10);
     const phoneQuery = phoneMatch.length >= 10 ? `%${phoneMatch}%` : 'NO_MATCH';
 
-    // 4. SECURITY FIX: Search Phone OR AWB *ONLY*. Do not search by Order Number.
+    // 🟢 FIX: Added o.financial_status to the SELECT query
     const { rows } = await pool.query(`
-      SELECT o.order_number, o.created_at, o.fulfillment_status, 
+      SELECT o.order_number, o.created_at, o.fulfillment_status, o.financial_status,
              s.awb, s.courier_source, s.last_state, s.last_status, s.history as db_history, s.last_checked_at 
       FROM orders_ops o 
       LEFT JOIN shipments_ops s ON s.order_id::text = o.id::text 
@@ -519,7 +515,20 @@ app.post("/track/customer", async (req, res) => {
       if (row.fulfillment_status === 'fulfilled') history.push({ status: "Dispatched", date: "Order Packed", completed: true });
       if (Array.isArray(row.db_history)) history = [...history, ...row.db_history];
 
-      return { shopify_order_name: row.order_number, awb: row.awb, current_state: row.last_state || (row.fulfillment_status === 'fulfilled' ? "IN_TRANSIT" : "PROCESSING"), courier: row.courier_source, last_known_status: row.last_status || "Shipment information will be updated shortly", tracking_history: history };
+      // 🟢 FIX: If order or shipment is cancelled, explicitly set state to CANCELLED
+      let currentState = row.last_state || (row.fulfillment_status === 'fulfilled' ? "IN_TRANSIT" : "PROCESSING");
+      if (row.financial_status === 'cancelled' || row.last_status === 'CANCELLED') {
+          currentState = "CANCELLED";
+      }
+
+      return { 
+         shopify_order_name: row.order_number, 
+         awb: row.awb, 
+         current_state: currentState, 
+         courier: row.courier_source, 
+         last_known_status: row.last_status || "Shipment information will be updated shortly", 
+         tracking_history: history 
+      };
     });
     res.json({ orders: results });
   } catch (e) { 
