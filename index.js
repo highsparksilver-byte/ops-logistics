@@ -474,16 +474,35 @@ app.post("/webhooks/returnprime", async (req, res) => {
 app.post("/track/customer", async (req, res) => {
   const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
   if (!checkRateLimit(ip)) return res.status(429).json({ error: "Too many requests" });
-  if (!req.body?.phone) return res.status(400).json({ error: "Phone required" });
+  
+  // 1. Accept either tracking_id, awb, or phone
+  const input = req.body?.tracking_id || req.body?.awb || req.body?.phone; 
+  if (!input) return res.status(400).json({ error: "Tracking ID required" });
 
   try {
-    const cleanInput = req.body.phone.toString().replace(/\D/g, "").slice(-10);
-    const { rows } = await pool.query(`SELECT o.order_number, o.created_at, o.fulfillment_status, s.awb, s.courier_source, s.last_state, s.last_status, s.history as db_history, s.last_checked_at FROM orders_ops o LEFT JOIN shipments_ops s ON s.order_id::text = o.id::text WHERE o.customer_phone::text LIKE $1 ORDER BY o.created_at DESC LIMIT 5`, [`%${cleanInput}`]);
+    // 2. Keep letters and numbers for AWB matching
+    const cleanInput = input.toString().trim().replace(/[^a-zA-Z0-9-]/g, ""); 
+    
+    // 3. Extract just the numbers for phone matching (fallback)
+    const phoneMatch = cleanInput.replace(/\D/g, "").slice(-10);
+    const phoneQuery = phoneMatch.length >= 10 ? `%${phoneMatch}%` : 'NO_MATCH';
+
+    // 4. SECURITY FIX: Search Phone OR AWB *ONLY*. Do not search by Order Number.
+    const { rows } = await pool.query(`
+      SELECT o.order_number, o.created_at, o.fulfillment_status, 
+             s.awb, s.courier_source, s.last_state, s.last_status, s.history as db_history, s.last_checked_at 
+      FROM orders_ops o 
+      LEFT JOIN shipments_ops s ON s.order_id::text = o.id::text 
+      WHERE o.customer_phone::text LIKE $1 
+         OR s.awb ILIKE $2
+      ORDER BY o.created_at DESC 
+      LIMIT 5
+    `, [phoneQuery, cleanInput]);
 
     const promises = rows.map(async (row) => {
       if (!row.awb || row.last_state === 'DELIVERED') return row; 
       const lastCheck = row.last_checked_at ? new Date(row.last_checked_at).getTime() : 0;
-      if (Date.now() - lastCheck > 60 * 1000) { // 1 min stale check
+      if (Date.now() - lastCheck > 60 * 1000) { 
         const fresh = await forceRefreshShipment(row.awb, row.courier_source);
         if (fresh) {
            row.last_state = resolveShipmentState(fresh.status);
