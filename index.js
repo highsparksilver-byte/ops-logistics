@@ -173,6 +173,7 @@ async function getShiprocketJwt() {
 
 const IGNORE_SCANS = ["BAGGED", "MANIFEST", "NETWORK", "RELIEF", "PARTIAL"];
 
+// 🟢 UPGRADED: Detects Return Journeys and grabs the New AWB
 async function trackBluedart(awb) {
   try {
     const r = await axios.get("https://api.bluedart.com/servlet/RoutingServlet", {
@@ -180,52 +181,54 @@ async function trackBluedart(awb) {
       responseType: "text"
     });
     
-    if (!r.data || r.data.trim().startsWith("<html")) {
-      logEvent('ERROR', 'TRACKING', `BlueDart HTML/Error Response`, { awb });
-      return null;
-    }
+    if (!r.data || r.data.trim().startsWith("<html")) return null;
     
     const p = await xml2js.parseStringPromise(r.data, { explicitArray: false });
-    
-    // 🟢 THE FIX: Handle both single objects AND Arrays (Forward + Return journeys)
-    let s = p?.ShipmentData?.Shipment; 
-    if (!s) { 
-        logEvent('WARN', 'TRACKING', `BlueDart Empty Data`, { awb }); 
-        return null; 
-    }
-    
-    // If BlueDart attached the return AWB, 's' becomes an array. We extract the first one (the original AWB).
-    if (Array.isArray(s)) {
-        s = s[0];
+    const shipments = p?.ShipmentData?.Shipment; 
+    if (!shipments) return null;
+
+    // Handle Array (RTO) vs Object (Normal)
+    const fwd = Array.isArray(shipments) ? shipments[0] : shipments;
+    const ret = Array.isArray(shipments) && shipments.length > 1 ? shipments[1] : null;
+
+    const isFwdDelivered = fwd.Status?.toUpperCase().includes("DELIVERED");
+    const isRetDelivered = ret ? ret.Status?.toUpperCase().includes("DELIVERED") : false;
+
+    // The AWB is truly "Done" if it reached the customer OR it reached the warehouse safely.
+    const isFinallyDone = isFwdDelivered || isRetDelivered;
+
+    // Create a smart compound status for the Google Sheet to read
+    let finalStatus = fwd.Status;
+    if (ret) {
+        const retAwb = ret.$?.WaybillNo || ret.WaybillNo || 'UNKNOWN';
+        finalStatus = `RTO | RET AWB: ${retAwb} | STATUS: ${ret.Status}`;
     }
 
-    const isFinal = s.Status?.toUpperCase().includes("DELIVERED");
-    const rawScans = Array.isArray(s.Scans?.ScanDetail) ? s.Scans.ScanDetail : [s.Scans?.ScanDetail];
+    const rawScans = Array.isArray(fwd.Scans?.ScanDetail) ? fwd.Scans.ScanDetail : [fwd.Scans?.ScanDetail];
+    let allScans = rawScans;
     
-    const scans = rawScans.filter(x => {
+    // Combine return scans into the history log so customers can see it travelling back
+    if (ret && Array.isArray(ret.Scans?.ScanDetail)) {
+        allScans = [...ret.Scans.ScanDetail, ...allScans]; 
+    }
+
+    const scans = allScans.filter(x => {
       if (!x?.Scan) return false;
-      if (isFinal) return true; 
+      if (isFinallyDone) return true; 
       return !IGNORE_SCANS.some(k => x.Scan.toUpperCase().includes(k));
     });
 
     return { 
-      status: s.Status, 
-      delivered: isFinal, 
+      status: finalStatus, 
+      delivered: isFinallyDone, // Automatically stops the watchdog loop!
       history: scans.map(x => {
         const date = x.ScanDate ? x.ScanDate.trim() : "";
         const time = x.ScanTime ? x.ScanTime.trim() : "00:00";
-        return { 
-          status: x.Scan, 
-          date: (date && time) ? `${date} ${time}` : new Date().toDateString(), 
-          location: x.ScannedLocation 
-        };
+        return { status: x.Scan, date: (date && time) ? `${date} ${time}` : new Date().toDateString(), location: x.ScannedLocation };
       }),
       raw: p 
     };
-  } catch (e) { 
-      logEvent('ERROR', 'TRACKING', `BlueDart Exception`, { awb, error: e.message }); 
-      return null; 
-  }
+  } catch (e) { logEvent('ERROR', 'TRACKING', `BlueDart Exception`, { awb, error: e.message }); return null; }
 }
 
 async function trackShiprocket(awb) {
@@ -348,16 +351,21 @@ async function syncOrder(o) {
   }
 }
 
-// 🟢 TURBO WATCHDOG (FIXED: Queue Clogging & Null Traps)
+// 🟢 UPGRADED: Smart Polling (Normal = 30 mins, RTO = 24 hours to save API calls)
 async function updateStaleShipments() {
   try {
-    // 1. FIXED SQL: Exclude RTOs so the queue doesn't get permanently choked
     const { rows } = await pool.query(`
       SELECT awb, courier_source 
       FROM shipments_ops 
       WHERE delivered = FALSE 
-      AND (last_checked_at IS NULL OR last_checked_at < NOW() - INTERVAL '30 minutes') 
-      AND (last_state IS NULL OR (last_state != 'RTO' AND last_state != 'CANCELLED'))
+      AND (last_status IS NULL OR last_status NOT LIKE '%CANCEL%')
+      AND (
+        -- Rule 1: Normal shipments checked every 30 minutes
+        (COALESCE(last_state, '') != 'RTO' AND (last_checked_at IS NULL OR last_checked_at < NOW() - INTERVAL '30 minutes'))
+        OR 
+        -- Rule 2: RTO shipments only checked every 24 hours
+        (last_state = 'RTO' AND last_checked_at < NOW() - INTERVAL '24 hours')
+      )
       LIMIT 50
     `);
     
@@ -365,42 +373,18 @@ async function updateStaleShipments() {
 
     for (const r of rows) {
       const t = r.courier_source === "bluedart" ? await trackBluedart(r.awb) : await trackShiprocket(r.awb);
-      
       if (t) {
         await pool.query(`
           UPDATE shipments_ops 
-          SET delivered=$1, 
-              last_status=$2, 
-              last_state=$3, 
-              history=$4::jsonb, 
-              raw_data=$5::jsonb, 
-              last_checked_at=NOW() 
+          SET delivered=$1, last_status=$2, last_state=$3, history=$4::jsonb, raw_data=$5::jsonb, last_checked_at=NOW() 
           WHERE awb=$6`, 
         [t.delivered, t.status, resolveShipmentState(t.status, t.history), JSON.stringify(t.history || []), JSON.stringify(t.raw || {}), r.awb]);
-        
-        if (t.status === "CANCELLED") {
-             logEvent('INFO', 'CLEANUP', `Marked AWB ${r.awb} as CANCELLED (Stopped Loop)`);
-        }
       } else {
-        // 2. THE NULL TRAP: If it fails, bump the timer. 
-        // Note: If an AWB is older than 15 days and still returning null, you may want to manually void it in the DB.
         await pool.query(`UPDATE shipments_ops SET last_checked_at=NOW() WHERE awb=$1`, [r.awb]);
-        logEvent('WARN', 'WATCHDOG', `API returned null for AWB ${r.awb}. Bumping timer.`);
       }
-      
-      // FAST SLEEP
       await new Promise(res => setTimeout(res, 500));
     }
   } catch (e) { logEvent('ERROR', 'SYNC', 'Stale Update Loop Failed', { error: e.message }); }
-}
-
-async function runBackfill() {
-  if (!SHOPIFY_ACCESS_TOKEN || !SHOP_NAME) return;
-  try {
-    const r = await axios.get(`https://${clean(SHOP_NAME)}.myshopify.com/admin/api/${API_VER}/orders.json?status=any&limit=50`, { headers: { "X-Shopify-Access-Token": clean(SHOPIFY_ACCESS_TOKEN) } });
-    for (const o of r.data.orders || []) await syncOrder(o);
-    logEvent('INFO', 'BACKFILL', `Backfilled ${r.data.orders.length} orders`);
-  } catch (e) { logEvent('ERROR', 'BACKFILL', 'Backfill Failed', { error: e.message }); }
 }
 
 // 🟢 NEW: SAFETY NET (CATCH MISSED CANCELLATIONS)
