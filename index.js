@@ -184,9 +184,20 @@ async function trackBluedart(awb) {
       logEvent('ERROR', 'TRACKING', `BlueDart HTML/Error Response`, { awb });
       return null;
     }
+    
     const p = await xml2js.parseStringPromise(r.data, { explicitArray: false });
-    const s = p?.ShipmentData?.Shipment; 
-    if (!s) { logEvent('WARN', 'TRACKING', `BlueDart Empty Data`, { awb }); return null; }
+    
+    // 🟢 THE FIX: Handle both single objects AND Arrays (Forward + Return journeys)
+    let s = p?.ShipmentData?.Shipment; 
+    if (!s) { 
+        logEvent('WARN', 'TRACKING', `BlueDart Empty Data`, { awb }); 
+        return null; 
+    }
+    
+    // If BlueDart attached the return AWB, 's' becomes an array. We extract the first one (the original AWB).
+    if (Array.isArray(s)) {
+        s = s[0];
+    }
 
     const isFinal = s.Status?.toUpperCase().includes("DELIVERED");
     const rawScans = Array.isArray(s.Scans?.ScanDetail) ? s.Scans.ScanDetail : [s.Scans?.ScanDetail];
@@ -211,7 +222,10 @@ async function trackBluedart(awb) {
       }),
       raw: p 
     };
-  } catch (e) { logEvent('ERROR', 'TRACKING', `BlueDart Exception`, { awb, error: e.message }); return null; }
+  } catch (e) { 
+      logEvent('ERROR', 'TRACKING', `BlueDart Exception`, { awb, error: e.message }); 
+      return null; 
+  }
 }
 
 async function trackShiprocket(awb) {
