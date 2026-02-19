@@ -361,7 +361,7 @@ async function updateStaleShipments() {
               raw_data=$5::jsonb, 
               last_checked_at=NOW() 
           WHERE awb=$6`, 
-        [t.delivered, t.status, resolveShipmentState(t.status), JSON.stringify(t.history || []), JSON.stringify(t.raw || {}), r.awb]);
+        [t.delivered, t.status, resolveShipmentState(t.status, t.history), JSON.stringify(t.history || []), JSON.stringify(t.raw || {}), r.awb]);
         
         if (t.status === "CANCELLED") {
              logEvent('INFO', 'CLEANUP', `Marked AWB ${r.awb} as CANCELLED (Stopped Loop)`);
@@ -439,7 +439,7 @@ async function forceRefreshShipment(awb, courier) {
       UPDATE shipments_ops 
       SET delivered=$1, last_status=$2, last_state=$3, history=$4::jsonb, raw_data=$5::jsonb, last_checked_at=NOW() 
       WHERE awb=$6
-    `, [t.delivered, t.status, resolveShipmentState(t.status), JSON.stringify(t.history || []), JSON.stringify(t.raw || {}), awb]);
+    `, [t.delivered, t.status, resolveShipmentState(t.status, t.history), JSON.stringify(t.history || []), JSON.stringify(t.raw || {}), awb]);
   } else {
     logEvent('WARN', 'TRACKING', `Live Refresh Failed`, { awb, courier });
   }
@@ -512,7 +512,7 @@ app.post("/track/customer", async (req, res) => {
       if (Date.now() - lastCheck > 60 * 1000) { 
         const fresh = await forceRefreshShipment(row.awb, row.courier_source);
         if (fresh) {
-           row.last_state = resolveShipmentState(fresh.status);
+           row.last_state = resolveShipmentState(fresh.status, fresh.history);
            row.last_status = fresh.status;
            row.db_history = fresh.history;
         }
