@@ -881,6 +881,7 @@ app.get("/admin/deep-sync", async (req, res) => {
 /* ===============================
    🚀 LOGISTICS REFRESHER (BATCH)
 ================================ */
+// 🟢 UPGRADED: Sweeps the oldest 100 packages every time you hit the URL
 app.get("/ops/refresh-logistics", async (req, res) => {
   if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
 
@@ -889,6 +890,7 @@ app.get("/ops/refresh-logistics", async (req, res) => {
       SELECT awb, courier_source 
       FROM shipments_ops 
       WHERE delivered = FALSE 
+      ORDER BY last_checked_at ASC NULLS FIRST
       LIMIT 100
     `);
 
@@ -899,7 +901,7 @@ app.get("/ops/refresh-logistics", async (req, res) => {
       await new Promise(resolve => setTimeout(resolve, 500));
     }
 
-    res.json({ message: `Successfully queued refresh for ${rows.length} shipments.` });
+    res.json({ message: `Successfully queued refresh for ${rows.length} shipments. Keep refreshing this page to do the next batch!` });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
