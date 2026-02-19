@@ -519,10 +519,11 @@ app.post("/track/customer", async (req, res) => {
 
       let currentState = row.last_state || (row.fulfillment_status === 'fulfilled' ? "IN_TRANSIT" : "PROCESSING");
       
-      // 🟢 FIX: Multi-layer check for cancelled orders
+      // 🟢 FIX: Multi-layer check for cancelled orders (Now includes 'refunded')
       const isCancelled = 
         row.financial_status === 'cancelled' || 
         row.financial_status === 'voided' || 
+        row.financial_status === 'refunded' || 
         (row.last_status && row.last_status.toUpperCase().includes('CANCEL'));
 
       if (isCancelled) {
