@@ -274,6 +274,9 @@ async function predictShiprocketEDD(p){try{const t=await getShiprocketJwt();if(!
 async function syncOrder(o) {
   const phone = o.phone || o.customer?.phone || o.shipping_address?.phone || null;
   
+  // 🟢 FIX: If Shopify has a cancelled_at date, forcefully lock the status to 'cancelled'
+  const actualFinancialStatus = o.cancelled_at ? 'cancelled' : o.financial_status;
+  
   try {
     await pool.query(`
       INSERT INTO orders_ops (
@@ -291,7 +294,7 @@ async function syncOrder(o) {
     `, [
       String(o.id), 
       o.name, 
-      o.financial_status, 
+      actualFinancialStatus, // 🟢 USING THE LOCKED STATUS HERE
       o.fulfillment_status, 
       o.total_price, 
       JSON.stringify(o.payment_gateway_names || []), 
@@ -483,7 +486,6 @@ app.post("/track/customer", async (req, res) => {
     const phoneMatch = cleanInput.replace(/\D/g, "").slice(-10);
     const phoneQuery = phoneMatch.length >= 10 ? `%${phoneMatch}%` : 'NO_MATCH';
 
-    // 🟢 FIX: Added o.financial_status to the SELECT query
     const { rows } = await pool.query(`
       SELECT o.order_number, o.created_at, o.fulfillment_status, o.financial_status,
              s.awb, s.courier_source, s.last_state, s.last_status, s.history as db_history, s.last_checked_at 
@@ -515,9 +517,15 @@ app.post("/track/customer", async (req, res) => {
       if (row.fulfillment_status === 'fulfilled') history.push({ status: "Dispatched", date: "Order Packed", completed: true });
       if (Array.isArray(row.db_history)) history = [...history, ...row.db_history];
 
-      // 🟢 FIX: If order or shipment is cancelled, explicitly set state to CANCELLED
       let currentState = row.last_state || (row.fulfillment_status === 'fulfilled' ? "IN_TRANSIT" : "PROCESSING");
-      if (row.financial_status === 'cancelled' || row.last_status === 'CANCELLED') {
+      
+      // 🟢 FIX: Multi-layer check for cancelled orders
+      const isCancelled = 
+        row.financial_status === 'cancelled' || 
+        row.financial_status === 'voided' || 
+        (row.last_status && row.last_status.toUpperCase().includes('CANCEL'));
+
+      if (isCancelled) {
           currentState = "CANCELLED";
       }
 
