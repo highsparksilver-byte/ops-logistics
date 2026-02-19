@@ -122,12 +122,21 @@ function checkRateLimit(ip) {
   r.c++; return true;
 }
 
-function resolveShipmentState(status = "") {
-  const s = status.toUpperCase();
+function resolveShipmentState(status = "", history = []) {
+  let s = status.toUpperCase();
+  
+  // 🟢 SMART BACKEND: Dig into the latest scan history to catch hidden errors
+  if (history && history.length > 0) {
+      const latestScan = history[history.length - 1];
+      if (latestScan && latestScan.status) {
+          s += " " + latestScan.status.toUpperCase(); // Combine them so we don't miss anything
+      }
+  }
+
   if (s.includes("DELIVERED")) return "DELIVERED";
   if (s.includes("RETURN") || s.includes("RTO")) return "RTO";
-  if (s.includes("FAILED") || s.includes("UNDELIVERED") || s.includes("REFUSED") || s.includes("CANCEL")) return "NDR";
-  if (s.includes("OUT FOR") || s.includes("DISPATCHED") || s.includes("IN TRANSIT") || s.includes("ARRIVED") || s.includes("PICKED") || s.includes("CONNECTED") || s.includes("SHIPPED")) return "IN_TRANSIT";
+  if (s.includes("FAILED") || s.includes("UNDELIVERED") || s.includes("REFUSED") || s.includes("REJECTED") || s.includes("CANCEL")) return "NDR";
+  if (s.includes("OUT FOR") || s.includes("OFD") || s.includes("DISPATCHED") || s.includes("IN TRANSIT") || s.includes("ARRIVED") || s.includes("PICKED") || s.includes("CONNECTED") || s.includes("SHIPPED")) return "IN_TRANSIT";
   return "PROCESSING";
 }
 
