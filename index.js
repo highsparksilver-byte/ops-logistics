@@ -19,22 +19,11 @@ app.use(express.json({
   verify: (req, res, buf) => { req.rawBody = buf.toString(); } 
 }));
 
+// 🟢 REVERTED TO GOLD STANDARD: Allows Shopify to fetch EDD without CORS errors
 app.use((req, res, next) => {
-  const allowedOrigins = [
-    "https://ops-dashboard-3c9eyrxoa-highsparksilver-1315s-projects.vercel.app", 
-    "http://localhost:3000"
-  ];
-  const origin = req.headers.origin;
-  
-  if (allowedOrigins.includes(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-  } else {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-  }
-  
+  res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-admin-key");
-  
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
 });
@@ -356,24 +345,18 @@ async function getCity(p){
   }
 }
 
-// 🟢 UPGRADED: Fixed BlueDart Date Formatting requirement
+// 🟢 REVERTED TO GOLD STANDARD: Exactly matches what BlueDart's EDD API strictly requires
 async function predictBluedartEDD(p) {
   try {
     const j = await getBluedartJwt();
     if (!j) return null;
-    
-    // Calculate the next working day in proper ISO format for BlueDart
-    const d = new Date();
-    const istTime = new Date(d.getTime() + (330 + d.getTimezoneOffset()) * 60000);
-    if (istTime.getDay() === 0) istTime.setDate(istTime.getDate() + 1); // Skip Sunday
-    const formattedDate = istTime.toISOString().split('T')[0]; // "YYYY-MM-DD"
     
     const r = await axios.post("https://apigateway.bluedart.com/in/transportation/transit/v1/GetDomesticTransitTimeForPinCodeandProduct", {
       pPinCodeFrom: "411022",
       pPinCodeTo: p,
       pProductCode: "A",
       pSubProductCode: "P",
-      pPudate: formattedDate, 
+      pPudate: new Date(new Date().getTime() + 330 * 60000).toISOString(),
       pPickupTime: "16:00", 
       profile: { Api_type: "S", LicenceKey: clean(BD_LICENCE_KEY_EDD), LoginID: clean(LOGIN_ID) }
     }, { headers: { JWTToken: j } });
@@ -561,7 +544,7 @@ cron.schedule('10 14 * * *', () => {
     logEvent('INFO', 'CACHE', 'EDD Cache cleared automatically at 14:10');
 }, {
     scheduled: true,
-    timezone: "Asia/Kolkata" // 👈 Vital: Ensures it runs at 2:10 PM India Time
+    timezone: "Asia/Kolkata" 
 });
 
 /* ===============================
@@ -699,7 +682,6 @@ app.post("/track/customer", async (req, res) => {
 
       let currentState = row.last_state || (row.fulfillment_status === 'fulfilled' ? "IN_TRANSIT" : "PROCESSING");
       
-      // 🟢 FIX: Multi-layer check for cancelled orders (Now includes 'refunded')
       const isCancelled = 
         row.financial_status === 'cancelled' || 
         row.financial_status === 'voided' || 
