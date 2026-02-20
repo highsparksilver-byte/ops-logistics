@@ -446,13 +446,13 @@ async function syncOrder(o) {
   }
 }
 
-// 🟢 UPGRADED: Added ORDER BY to cycle through the oldest unchecked packages first
 async function updateStaleShipments() {
   try {
     const { rows } = await pool.query(`
       SELECT awb, courier_source 
       FROM shipments_ops 
-      WHERE delivered = FALSE 
+      -- 🟢 THE FIX: Catch both FALSE and NULL statuses
+      WHERE (delivered = FALSE OR delivered IS NULL) 
       AND (last_status IS NULL OR last_status NOT LIKE '%CANCEL%')
       AND (
         (COALESCE(last_state, '') != 'RTO' AND (last_checked_at IS NULL OR last_checked_at < NOW() - INTERVAL '30 minutes'))
@@ -915,32 +915,36 @@ app.get("/admin/deep-sync", async (req, res) => {
 });
 
 /* ===============================
-   🚀 LOGISTICS REFRESHER (BATCH)
+   🚀 LOGISTICS REFRESHER (BACKGROUND BATCH)
 ================================ */
-// 🟢 UPGRADED: Sweeps the oldest 100 packages every time you hit the URL
 app.get("/ops/refresh-logistics", async (req, res) => {
   if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
 
-  try {
-    const { rows } = await pool.query(`
-      SELECT awb, courier_source 
-      FROM shipments_ops 
-      WHERE delivered = FALSE 
-      ORDER BY last_checked_at ASC NULLS FIRST
-      LIMIT 100
-    `);
+  res.json({ message: "🚀 Background mass-refresh started! Processing up to 500 packages. Please check your sheet in about 15 minutes." });
 
-    logEvent('INFO', 'RECOVERY', `Found ${rows.length} shipments to refresh.`);
+  (async () => {
+    try {
+      const { rows } = await pool.query(`
+        SELECT awb, courier_source 
+        FROM shipments_ops 
+        -- 🟢 THE FIX: Ensure the manual sweeper also catches NULLs
+        WHERE (delivered = FALSE OR delivered IS NULL) 
+        ORDER BY last_checked_at ASC NULLS FIRST
+        LIMIT 500
+      `);
 
-    for (const r of rows) {
-      await forceRefreshShipment(r.awb, r.courier_source);
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      logEvent('INFO', 'RECOVERY', `Background sweep started for ${rows.length} stuck shipments.`);
+
+      for (const r of rows) {
+        await forceRefreshShipment(r.awb, r.courier_source);
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+      
+      logEvent('INFO', 'RECOVERY', `✅ Background sweep finished successfully!`);
+    } catch (e) {
+      logEvent('ERROR', 'RECOVERY', 'Background sweep crashed', { error: e.message });
     }
-
-    res.json({ message: `Successfully queued refresh for ${rows.length} shipments. Keep refreshing this page to do the next batch!` });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  })(); 
 });
 
 /* ===============================
