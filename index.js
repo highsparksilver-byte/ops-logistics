@@ -345,7 +345,7 @@ async function getCity(p){
   }
 }
 
-// 🟢 REVERTED TO GOLD STANDARD: Exactly matches what BlueDart's EDD API strictly requires
+// 🟢 RESTORED TO GOLD STANDARD: Exactly matches BlueDart's strict WCF /Date(ms)/ format
 async function predictBluedartEDD(p) {
   try {
     const j = await getBluedartJwt();
@@ -356,7 +356,7 @@ async function predictBluedartEDD(p) {
       pPinCodeTo: p,
       pProductCode: "A",
       pSubProductCode: "P",
-      pPudate: new Date(new Date().getTime() + 330 * 60000).toISOString(),
+      pPudate: getNextWorkingDate(), // 🟢 THE FIX: Reverted to your working /Date()/ generator
       pPickupTime: "16:00", 
       profile: { Api_type: "S", LicenceKey: clean(BD_LICENCE_KEY_EDD), LoginID: clean(LOGIN_ID) }
     }, { headers: { JWTToken: j } });
