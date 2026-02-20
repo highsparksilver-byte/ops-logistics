@@ -356,19 +356,28 @@ async function getCity(p){
   }
 }
 
+// 🟢 UPGRADED: Fixed BlueDart Date Formatting requirement
 async function predictBluedartEDD(p) {
   try {
     const j = await getBluedartJwt();
     if (!j) return null;
+    
+    // Calculate the next working day in proper ISO format for BlueDart
+    const d = new Date();
+    const istTime = new Date(d.getTime() + (330 + d.getTimezoneOffset()) * 60000);
+    if (istTime.getDay() === 0) istTime.setDate(istTime.getDate() + 1); // Skip Sunday
+    const formattedDate = istTime.toISOString().split('T')[0]; // "YYYY-MM-DD"
+    
     const r = await axios.post("https://apigateway.bluedart.com/in/transportation/transit/v1/GetDomesticTransitTimeForPinCodeandProduct", {
       pPinCodeFrom: "411022",
       pPinCodeTo: p,
       pProductCode: "A",
       pSubProductCode: "P",
-      pPudate: getNextWorkingDate(), 
-      pPickupTime: "14:00", 
+      pPudate: formattedDate, 
+      pPickupTime: "16:00", 
       profile: { Api_type: "S", LicenceKey: clean(BD_LICENCE_KEY_EDD), LoginID: clean(LOGIN_ID) }
     }, { headers: { JWTToken: j } });
+    
     return r.data?.GetDomesticTransitTimeForPinCodeandProductResult?.ExpectedDateDelivery || null;
   } catch (e) { 
     logEvent('ERROR', 'EDD', `BlueDart EDD Error`, { error: e.message });
