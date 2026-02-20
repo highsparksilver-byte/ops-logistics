@@ -478,7 +478,7 @@ async function updateStaleShipments() {
         await pool.query(`UPDATE shipments_ops SET last_checked_at=NOW() WHERE awb=$1`, [r.awb]);
       }
       
-      await new Promise(res => setTimeout(res, 500));
+      await new Promise(res => setTimeout(res, 2000));
     }
   } catch (e) { 
     logEvent('ERROR', 'SYNC', 'Stale Update Loop Failed', { error: e.message }); 
@@ -829,6 +829,42 @@ app.get("/admin/force-single", async (req, res) => {
 });
 
 /* ===============================
+   🔍 DATABASE X-RAY (DEBUG TOOL)
+================================ */
+app.get("/admin/debug-awb", async (req, res) => {
+  if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
+  
+  const { awb } = req.query;
+  if (!awb) return res.status(400).json({ error: "AWB Required" });
+
+  try {
+    const { rows } = await pool.query(`
+      SELECT 
+        awb, 
+        order_id, 
+        courier_source, 
+        delivered, 
+        last_status, 
+        last_state, 
+        last_checked_at 
+      FROM shipments_ops 
+      WHERE awb = $1
+    `, [awb]);
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "AWB not found in database at all!" });
+    }
+
+    res.json({ 
+      message: "Here is the exact data sitting in PostgreSQL:",
+      db_row: rows[0] 
+    });
+  } catch (e) { 
+    res.status(500).json({ error: e.message }); 
+  }
+});
+
+/* ===============================
    🚀 DEEP SYNC
 ================================ */
 app.get("/admin/deep-sync", async (req, res) => {
@@ -898,7 +934,7 @@ app.get("/ops/refresh-logistics", async (req, res) => {
 
     for (const r of rows) {
       await forceRefreshShipment(r.awb, r.courier_source);
-      await new Promise(resolve => setTimeout(resolve, 500));
+      await new Promise(resolve => setTimeout(resolve, 2000));
     }
 
     res.json({ message: `Successfully queued refresh for ${rows.length} shipments. Keep refreshing this page to do the next batch!` });
