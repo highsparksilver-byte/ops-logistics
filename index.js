@@ -345,26 +345,40 @@ async function getCity(p){
   }
 }
 
-// 🟢 RESTORED TO GOLD STANDARD: Exactly matches BlueDart's strict WCF /Date(ms)/ format
+// 🔍 DEBUG MODE: BlueDart EDD
 async function predictBluedartEDD(p) {
   try {
     const j = await getBluedartJwt();
-    if (!j) return null;
+    if (!j) return { error: "Failed to generate BlueDart JWT" };
+
+    const pickupDateStr = getNextWorkingDate();
     
-    const r = await axios.post("https://apigateway.bluedart.com/in/transportation/transit/v1/GetDomesticTransitTimeForPinCodeandProduct", {
+    const payload = {
       pPinCodeFrom: "411022",
       pPinCodeTo: p,
       pProductCode: "A",
       pSubProductCode: "P",
-      pPudate: getNextWorkingDate(), // 🟢 THE FIX: Reverted to your working /Date()/ generator
+      pPudate: pickupDateStr, 
       pPickupTime: "16:00", 
       profile: { Api_type: "S", LicenceKey: clean(BD_LICENCE_KEY_EDD), LoginID: clean(LOGIN_ID) }
-    }, { headers: { JWTToken: j } });
+    };
+
+    // 1. Log what we are sending
+    console.log("➡️ Sending to BlueDart:", JSON.stringify(payload));
+
+    const r = await axios.post("https://apigateway.bluedart.com/in/transportation/transit/v1/GetDomesticTransitTimeForPinCodeandProduct", payload, { headers: { JWTToken: j } });
     
+    // 2. Log what they sent back
+    console.log("⬅️ BlueDart Success Response:", JSON.stringify(r.data));
+
     return r.data?.GetDomesticTransitTimeForPinCodeandProductResult?.ExpectedDateDelivery || null;
   } catch (e) { 
-    logEvent('ERROR', 'EDD', `BlueDart EDD Error`, { error: e.message });
-    return null; 
+    // 3. Catch the EXACT error message from their server
+    const errDetails = e.response?.data ? JSON.stringify(e.response?.data) : e.message;
+    console.error("❌ BlueDart EDD Rejected:", errDetails);
+    
+    // Return the error string so we can see it in curl
+    return { error: errDetails }; 
   }
 }
 
@@ -984,34 +998,46 @@ app.get("/ops/api-usage", async (req, res) => {
 });
 
 /* ===============================
-   🚚 EDD ENDPOINT
+   🚚 EDD ENDPOINT (DEBUG MODE)
 ================================ */
 app.post("/edd", async (req, res) => {
   const { pincode } = req.body;
-  if (!/^\d{6}$/.test(pincode)) return res.json({ edd_display: null });
+  if (!/^\d{6}$/.test(pincode)) return res.json({ edd_display: null, debug: "Invalid Pin" });
   
-  if (eddCache.has(pincode)) return res.json(eddCache.get(pincode));
+  // 🛑 CACHE TEMPORARILY DISABLED FOR DEBUGGING
+  // if (eddCache.has(pincode)) return res.json(eddCache.get(pincode));
 
   const city = await getCity(pincode);
   
   let rawDate = await predictBluedartEDD(pincode);
-  let source = "BlueDart"; 
-
-  if (!rawDate) {
+  
+  // 🛑 SHIPROCKET FALLBACK TEMPORARILY DISABLED
+  /*
+  if (!rawDate || rawDate.error) {
     rawDate = await predictShiprocketEDD(pincode);
     source = "Shiprocket";
   }
+  */
+
+  // If BlueDart returned an error object, print it to curl!
+  if (rawDate && rawDate.error) {
+    return res.json({ 
+      source: "BlueDart_Failed", 
+      error_message: rawDate.error 
+    });
+  }
   
-  if (!rawDate) return res.json({ edd_display: null });
+  if (!rawDate) return res.json({ edd_display: null, debug: "BlueDart returned null but no explicit error." });
   
   const data = { 
     edd_display: formatConfidenceBand(rawDate), 
     city, 
     badge: city && ["MUMBAI","DELHI","BANGALORE","PUNE"].some(m=>city.toUpperCase().includes(m)) ? "METRO_EXPRESS" : "EXPRESS",
-    source: source 
+    source: "BlueDart",
+    raw_date_from_bluedart: rawDate // Show exactly what date string they gave us
   };
   
-  eddCache.set(pincode, data);
+  // eddCache.set(pincode, data);
   res.json(data);
 });
 
