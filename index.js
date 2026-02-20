@@ -19,7 +19,7 @@ app.use(express.json({
   verify: (req, res, buf) => { req.rawBody = buf.toString(); } 
 }));
 
-// 🟢 REVERTED TO GOLD STANDARD: Allows Shopify to fetch EDD without CORS errors
+// 🟢 REVERTED TO GOLD STANDARD: Allows Shopify and Vercel to fetch EDD without CORS errors
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -345,15 +345,15 @@ async function getCity(p){
   }
 }
 
-// 🔍 DEBUG MODE: BlueDart EDD
+// 🟢 RESTORED TO GOLD STANDARD: Exactly matches BlueDart's strict WCF /Date(ms)/ format
 async function predictBluedartEDD(p) {
   try {
     const j = await getBluedartJwt();
-    if (!j) return { error: "Failed to generate BlueDart JWT" };
+    if (!j) return null;
 
     const pickupDateStr = getNextWorkingDate();
     
-    const payload = {
+    const r = await axios.post("https://apigateway.bluedart.com/in/transportation/transit/v1/GetDomesticTransitTimeForPinCodeandProduct", {
       pPinCodeFrom: "411022",
       pPinCodeTo: p,
       pProductCode: "A",
@@ -361,24 +361,12 @@ async function predictBluedartEDD(p) {
       pPudate: pickupDateStr, 
       pPickupTime: "16:00", 
       profile: { Api_type: "S", LicenceKey: clean(BD_LICENCE_KEY_EDD), LoginID: clean(LOGIN_ID) }
-    };
-
-    // 1. Log what we are sending
-    console.log("➡️ Sending to BlueDart:", JSON.stringify(payload));
-
-    const r = await axios.post("https://apigateway.bluedart.com/in/transportation/transit/v1/GetDomesticTransitTimeForPinCodeandProduct", payload, { headers: { JWTToken: j } });
+    }, { headers: { JWTToken: j } });
     
-    // 2. Log what they sent back
-    console.log("⬅️ BlueDart Success Response:", JSON.stringify(r.data));
-
     return r.data?.GetDomesticTransitTimeForPinCodeandProductResult?.ExpectedDateDelivery || null;
   } catch (e) { 
-    // 3. Catch the EXACT error message from their server
-    const errDetails = e.response?.data ? JSON.stringify(e.response?.data) : e.message;
-    console.error("❌ BlueDart EDD Rejected:", errDetails);
-    
-    // Return the error string so we can see it in curl
-    return { error: errDetails }; 
+    logEvent('ERROR', 'EDD', `BlueDart EDD API Failed`, { error: e.message });
+    return null; 
   }
 }
 
@@ -696,6 +684,7 @@ app.post("/track/customer", async (req, res) => {
 
       let currentState = row.last_state || (row.fulfillment_status === 'fulfilled' ? "IN_TRANSIT" : "PROCESSING");
       
+      // 🟢 FIX: Multi-layer check for cancelled orders (Now includes 'refunded')
       const isCancelled = 
         row.financial_status === 'cancelled' || 
         row.financial_status === 'voided' || 
@@ -707,12 +696,12 @@ app.post("/track/customer", async (req, res) => {
       }
 
       return { 
-         shopify_order_name: row.order_number, 
-         awb: row.awb, 
-         current_state: currentState, 
-         courier: row.courier_source, 
-         last_known_status: row.last_status || "Shipment information will be updated shortly", 
-         tracking_history: history 
+          shopify_order_name: row.order_number, 
+          awb: row.awb, 
+          current_state: currentState, 
+          courier: row.courier_source, 
+          last_known_status: row.last_status || "Shipment information will be updated shortly", 
+          tracking_history: history 
       };
     });
     
@@ -998,46 +987,36 @@ app.get("/ops/api-usage", async (req, res) => {
 });
 
 /* ===============================
-   🚚 EDD ENDPOINT (DEBUG MODE)
+   🚚 EDD ENDPOINT (FINAL PRODUCTION VERSION)
 ================================ */
 app.post("/edd", async (req, res) => {
   const { pincode } = req.body;
-  if (!/^\d{6}$/.test(pincode)) return res.json({ edd_display: null, debug: "Invalid Pin" });
+  if (!/^\d{6}$/.test(pincode)) return res.json({ edd_display: null });
   
-  // 🛑 CACHE TEMPORARILY DISABLED FOR DEBUGGING
-  // if (eddCache.has(pincode)) return res.json(eddCache.get(pincode));
+  if (eddCache.has(pincode)) return res.json(eddCache.get(pincode));
 
   const city = await getCity(pincode);
   
+  // 🟢 PRIMARY: Try BlueDart
   let rawDate = await predictBluedartEDD(pincode);
-  
-  // 🛑 SHIPROCKET FALLBACK TEMPORARILY DISABLED
-  /*
-  if (!rawDate || rawDate.error) {
+  let source = "BlueDart"; 
+
+  // 🟢 SECONDARY: Fallback to Shiprocket ONLY if BlueDart fails
+  if (!rawDate) {
     rawDate = await predictShiprocketEDD(pincode);
     source = "Shiprocket";
   }
-  */
-
-  // If BlueDart returned an error object, print it to curl!
-  if (rawDate && rawDate.error) {
-    return res.json({ 
-      source: "BlueDart_Failed", 
-      error_message: rawDate.error 
-    });
-  }
   
-  if (!rawDate) return res.json({ edd_display: null, debug: "BlueDart returned null but no explicit error." });
+  if (!rawDate) return res.json({ edd_display: null });
   
   const data = { 
     edd_display: formatConfidenceBand(rawDate), 
     city, 
     badge: city && ["MUMBAI","DELHI","BANGALORE","PUNE"].some(m=>city.toUpperCase().includes(m)) ? "METRO_EXPRESS" : "EXPRESS",
-    source: "BlueDart",
-    raw_date_from_bluedart: rawDate // Show exactly what date string they gave us
+    source: source 
   };
   
-  // eddCache.set(pincode, data);
+  eddCache.set(pincode, data);
   res.json(data);
 });
 
