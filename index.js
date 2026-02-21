@@ -612,8 +612,9 @@ app.post("/webhooks/orders_updated", (req, res) => {
   res.sendStatus(200); 
   
   if (verifyShopify(req)) {
-    logEvent('INFO', 'WEBHOOK', `Order Updated (Catching Cancellations): ${req.body.name}`);
-    syncOrder(req.body); // This safely catches o.cancelled_at instantly
+    logEvent('INFO', 'WEBHOOK', `Order Updated: ${req.body.name}`);
+    // This safely catches o.cancelled_at instantly
+    syncOrder(req.body); 
   }
 });
 
@@ -696,18 +697,18 @@ app.post("/track/customer", async (req, res) => {
       let currentState = row.last_state || (row.fulfillment_status === 'fulfilled' ? "IN_TRANSIT" : "PROCESSING");
       
       // 🟢 FIX: Multi-layer check for cancelled orders (Now scans full history)
-const historyStr = JSON.stringify(row.db_history || []).toUpperCase();
+      const historyStr = JSON.stringify(row.db_history || []).toUpperCase();
 
-const isCancelled =
-  row.financial_status === 'cancelled' ||
-  row.financial_status === 'voided' ||
-  row.financial_status === 'refunded' ||
-  (row.last_status && row.last_status.toUpperCase().includes('CANCEL')) ||
-  historyStr.includes('CANCEL'); // Catches cancellations hidden in previous scans
+      const isCancelled = 
+        row.financial_status === 'cancelled' || 
+        row.financial_status === 'voided' || 
+        row.financial_status === 'refunded' || 
+        (row.last_status && row.last_status.toUpperCase().includes('CANCEL')) ||
+        historyStr.includes('CANCEL');
 
-if (isCancelled) {
-    currentState = "CANCELLED";
-}
+      if (isCancelled) {
+          currentState = "CANCELLED";
+      }
 
       return { 
           shopify_order_name: row.order_number, 
