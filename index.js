@@ -528,9 +528,8 @@ async function runSafetyNet() {
 // ⏲️ CRON SCHEDULES
 setTimeout(runBackfill, 5000); // Run once on startup
 
-// 1. Regular Backfill & Watchdog (Every 10 mins)
+// 1. Watchdog ONLY (Every 10 mins) - Backfill removed to save Shopify API
 setInterval(() => { 
-  runBackfill(); 
   updateStaleShipments(); 
 }, 10 * 60 * 1000);
 
@@ -653,12 +652,15 @@ app.post("/track/customer", async (req, res) => {
       LIMIT 5
     `, [phoneQuery, cleanInput]);
 
-    const promises = rows.map(async (row) => {
+   const promises = rows.map(async (row) => {
       if (!row.awb || row.last_state === 'DELIVERED') return row; 
       
       const lastCheck = row.last_checked_at ? new Date(row.last_checked_at).getTime() : 0;
       
-      if (Date.now() - lastCheck > 60 * 1000) { 
+      // 🟢 THE FIX: Increased cooldown to 30 mins (30 * 60 * 1000) & blocked TEST/fake AWBs
+      const isTestAwb = row.awb.toUpperCase().includes('TEST') || row.awb.length < 5;
+      
+      if (!isTestAwb && Date.now() - lastCheck > 30 * 60 * 1000) { 
         const fresh = await forceRefreshShipment(row.awb, row.courier_source);
         if (fresh) {
            row.last_state = resolveShipmentState(fresh.status, fresh.history);
