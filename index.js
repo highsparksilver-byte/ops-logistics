@@ -874,6 +874,30 @@ app.get("/admin/debug-awb", async (req, res) => {
 });
 
 /* ===============================
+   🔍 DATABASE X-RAY (ORDERS)
+================================ */
+app.get("/admin/debug-order", async (req, res) => {
+  if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
+  
+  const { id } = req.query;
+  if (!id) return res.status(400).json({ error: "Order ID Required" });
+
+  try {
+    const { rows } = await pool.query(`
+      SELECT id, order_number, financial_status, fulfillment_status, created_at 
+      FROM orders_ops 
+      WHERE id = $1 OR order_number = $1
+    `, [id]);
+
+    if (rows.length === 0) return res.status(404).json({ error: "Order not found in DB" });
+
+    res.json({ db_row: rows[0] });
+  } catch (e) { 
+    res.status(500).json({ error: e.message }); 
+  }
+});
+
+/* ===============================
    🚀 DEEP SYNC (JAN 1st TO PRESENT - UNLIMITED)
 ================================ */
 app.get("/admin/deep-sync", async (req, res) => {
