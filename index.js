@@ -874,23 +874,22 @@ app.get("/admin/debug-awb", async (req, res) => {
 });
 
 /* ===============================
-   🚀 DEEP SYNC
+   🚀 DEEP SYNC (JAN 1st TO PRESENT - UNLIMITED)
 ================================ */
 app.get("/admin/deep-sync", async (req, res) => {
   if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
 
   try {
-    const d = new Date();
-    d.setDate(d.getDate() - 20); // Sync last 20 days
-    const minDate = d.toISOString();
+    // 🟢 Hardcoded to January 1st of the current year
+    const minDate = new Date(new Date().getFullYear(), 0, 1).toISOString(); 
 
-    logEvent('INFO', 'DEEP_SYNC', `Starting Deep Sync from ${minDate}...`);
+    logEvent('INFO', 'DEEP_SYNC', `Starting Deep Sync from ${minDate} for ALL orders...`);
 
     let url = `https://${clean(SHOP_NAME)}.myshopify.com/admin/api/${API_VER}/orders.json?status=any&limit=250&updated_at_min=${minDate}`;
     let totalSynced = 0;
 
-    // 🟢 PAGINATION LOOP: Keep fetching until we hit 1000 or run out
-    while (url && totalSynced < 1000) {
+    // 🟢 Removed the 1000/3000 limit. It will run until every single page is done.
+    while (url) {
        const r = await axios.get(url, { 
          headers: { "X-Shopify-Access-Token": clean(SHOPIFY_ACCESS_TOKEN) } 
        });
@@ -903,6 +902,7 @@ app.get("/admin/deep-sync", async (req, res) => {
        }
        
        totalSynced += orders.length;
+       console.log(`⏳ Deep Sync Progress: ${totalSynced} orders processed...`);
        
        // 🟢 CHECK FOR NEXT PAGE (Cursor Pagination)
        const linkHeader = r.headers.link || r.headers['link']; 
@@ -915,7 +915,7 @@ app.get("/admin/deep-sync", async (req, res) => {
     }
 
     logEvent('INFO', 'DEEP_SYNC', `Deep Sync Complete. Total Orders: ${totalSynced}`);
-    res.json({ success: true, count: totalSynced, message: `Synced ${totalSynced} orders.` });
+    res.json({ success: true, count: totalSynced, message: `Successfully synced all ${totalSynced} orders since Jan 1st.` });
 
   } catch (e) {
     logEvent('ERROR', 'DEEP_SYNC', 'Failed', { error: e.message });
