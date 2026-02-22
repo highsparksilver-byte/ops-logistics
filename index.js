@@ -898,6 +898,20 @@ app.get("/admin/debug-order", async (req, res) => {
 });
 
 /* ===============================
+   🔍 DATABASE X-RAY (RETURNS)
+================================ */
+app.get("/admin/debug-returns", async (req, res) => {
+  if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
+
+  try {
+    const { rows } = await pool.query(`SELECT * FROM returns_ops ORDER BY updated_at DESC LIMIT 50`);
+    res.json({ total_records: rows.length, recent_data: rows });
+  } catch (e) { 
+    res.status(500).json({ error: e.message }); 
+  }
+});
+
+/* ===============================
    🚀 DEEP SYNC (JAN 1st TO PRESENT - UNLIMITED)
 ================================ */
 app.get("/admin/deep-sync", async (req, res) => {
