@@ -135,8 +135,21 @@ function nowIST() {
 
 function getNextWorkingDate() {
   const d = nowIST();
-  if (d.getDay() === 0) d.setDate(d.getDate() + 1); // Skip Sunday
-  return `/Date(${d.getTime()})/`;
+  
+  // 🟢 THE FIX: If it's past 14:00 (2:00 PM) IST, the pickup rolls over to tomorrow
+  if (d.getHours() >= 14) {
+    d.setDate(d.getDate() + 1);
+  }
+
+  // If the scheduled pickup day falls on a Sunday, push it to Monday
+  if (d.getDay() === 0) {
+    d.setDate(d.getDate() + 1);
+  }
+
+  // Reset time to exactly midnight so BlueDart gets a perfectly clean date
+  d.setHours(0, 0, 0, 0);
+
+  return `/Date(${d.getTime()})/`; 
 }
 
 /* ===============================
@@ -453,17 +466,30 @@ async function predictBluedartEDD(p) {
   try {
     const j = await getBluedartJwt();
     if (!j) return null;
+    
+    // Optional: Keep the jitter to prevent rate limits colliding with the watchdog
+    await new Promise(res => setTimeout(res, Math.random() * 400 + 100));
+
     const r = await axios.post(
       "https://apigateway.bluedart.com/in/transportation/transit/v1/GetDomesticTransitTimeForPinCodeandProduct",
       {
-        pPinCodeFrom: "411022", pPinCodeTo: p, pProductCode: "A", pSubProductCode: "P",
-        pPudate: getNextWorkingDate(), pPickupTime: "14:00",
+        pPinCodeFrom: "411022", 
+        pPinCodeTo: p, 
+        pProductCode: "A", 
+        pSubProductCode: "P",
+        pPudate: getNextWorkingDate(), 
+        pPickupTime: "14:00", // 🟢 Ensure this explicitly says "14:00"
         profile: { Api_type: "S", LicenceKey: clean(BD_LICENCE_KEY_EDD), LoginID: clean(LOGIN_ID) }
       },
       { headers: { JWTToken: j }, httpsAgent }
     );
     return r.data?.GetDomesticTransitTimeForPinCodeandProductResult?.ExpectedDateDelivery || null;
-  } catch (e) { logEvent('ERROR', 'EDD', 'BlueDart EDD Failed', { error: e.message }); return null; }
+  } catch (e) { 
+    // Upgraded error logger to catch the exact reason BlueDart rejects it
+    const errDetail = e.response?.data ? JSON.stringify(e.response.data) : e.message;
+    logEvent('ERROR', 'EDD', 'BlueDart EDD Failed', { error: errDetail }); 
+    return null; 
+  }
 }
 
 async function predictShiprocketEDD(p) {
