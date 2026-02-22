@@ -618,27 +618,40 @@ app.post("/webhooks/orders_updated", (req, res) => {
   }
 });
 
+/* ===============================
+   RETURN PRIME WEBHOOK
+================================ */
 app.post("/webhooks/returnprime", async (req, res) => {
   res.sendStatus(200); 
-  const e = req.body;
+  const payload = req.body;
   
-  // 🟢 LOG EVERYTHING: Even if it fails, we want to see the shape of the data
-  logEvent('INFO', 'WEBHOOK', `ReturnPrime Hit!`, { raw_payload: e });
+  // Return Prime wraps everything inside a "request" object!
+  const rp = payload.request;
+  
+  if (!rp) {
+     logEvent('WARN', 'WEBHOOK', 'ReturnPrime payload missing "request" object', { payload });
+     return;
+  }
 
-  // Adjusting to catch multiple possible field names Return Prime might use
-  const returnId = e.id || e.return_id || e.channel_id;
-  const orderNumber = e.order_number || e.orderId || e.order_name;
-  const returnStatus = e.status || e.return_status || "created";
+  const returnId = rp.id;
+  const orderNumber = rp.order?.name; // e.g., "#HS5220014"
+  const returnStatus = rp.status;     // e.g., "requested", "approved", "inspected"
 
   if (!returnId || !orderNumber) {
-     logEvent('WARN', 'WEBHOOK', 'ReturnPrime payload missing ID or Order Number', { payload: e });
+     logEvent('WARN', 'WEBHOOK', 'ReturnPrime payload missing ID or Order Number', { payload });
      return;
   }
   
-  await pool.query(
-    `INSERT INTO returns_ops (return_id, order_number, status, updated_at) VALUES ($1,$2,$3,NOW()) ON CONFLICT (return_id) DO UPDATE SET status=EXCLUDED.status, updated_at=NOW()`, 
-    [String(returnId), String(orderNumber), String(returnStatus)]
-  );
+  try {
+    await pool.query(
+      `INSERT INTO returns_ops (return_id, order_number, status, updated_at) VALUES ($1,$2,$3,NOW()) ON CONFLICT (return_id) DO UPDATE SET status=EXCLUDED.status, updated_at=NOW()`, 
+      [String(returnId), String(orderNumber), String(returnStatus)]
+    );
+    
+    logEvent('INFO', 'WEBHOOK', `ReturnPrime Processed: ${orderNumber} is now ${returnStatus}`);
+  } catch (e) {
+    logEvent('ERROR', 'WEBHOOK', `ReturnPrime DB Error for ${orderNumber}`, { error: e.message });
+  }
 });
 
 /* ===============================
