@@ -453,39 +453,45 @@ async function syncOrder(o) {
 async function updateStaleShipments() {
   try {
     const { rows } = await pool.query(`
-      SELECT awb, courier_source 
-      FROM shipments_ops 
-      -- 🟢 THE FIX: Catch both FALSE and NULL statuses
+      SELECT awb, courier_source FROM shipments_ops 
       WHERE (delivered = FALSE OR delivered IS NULL) 
       AND (last_status IS NULL OR last_status NOT LIKE '%CANCEL%')
-      AND (
-        (COALESCE(last_state, '') != 'RTO' AND (last_checked_at IS NULL OR last_checked_at < NOW() - INTERVAL '30 minutes'))
-        OR 
-        (last_state = 'RTO' AND last_checked_at < NOW() - INTERVAL '24 hours')
-      )
-      ORDER BY last_checked_at ASC NULLS FIRST
-      LIMIT 25
+      AND ((COALESCE(last_state, '') != 'RTO' AND (last_checked_at IS NULL OR last_checked_at < NOW() - INTERVAL '30 minutes')) OR (last_state = 'RTO' AND last_checked_at < NOW() - INTERVAL '24 hours'))
+      ORDER BY last_checked_at ASC NULLS FIRST LIMIT 10
     `);
     
     if (rows.length > 0) logEvent('INFO', 'WATCHDOG', `Checking ${rows.length} stale orders...`);
 
     for (const r of rows) {
+      // 🟢 STEP 1: Define safe strings to prevent crashes on nulls
+      const safeAwb = String(r.awb || "");
+      
+      // 🟢 STEP 2: The Filter Logic
+      // Check if it's BlueDart but NOT an 11-digit number starting with 8 or 9
+      const isInvalidBD = r.courier_source === "bluedart" && !/^[89]\d{10}$/.test(safeAwb);
+      const isTestAwb = safeAwb.toUpperCase().includes('TEST');
+
+      if (isInvalidBD || isTestAwb || safeAwb.length < 5) {
+        // Log it locally and move it to the back of the queue
+        console.log(`🚫 Skipping Invalid AWB: ${safeAwb}`);
+        await pool.query(`UPDATE shipments_ops SET last_checked_at=NOW(), last_status='INVALID_AWB' WHERE awb=$1`, [r.awb]);
+        continue; // ⏭️ Skips the API call and moves to the next order in the loop
+      }
+
+      // 🟢 STEP 3: Only real AWBs reach this point
       const t = r.courier_source === "bluedart" ? await trackBluedart(r.awb) : await trackShiprocket(r.awb);
       
       if (t) {
-        await pool.query(`
-          UPDATE shipments_ops 
-          SET delivered=$1, last_status=$2, last_state=$3, history=$4::jsonb, raw_data=$5::jsonb, last_checked_at=NOW() 
-          WHERE awb=$6`, 
-        [t.delivered, t.status, resolveShipmentState(t.status, t.history), JSON.stringify(t.history || []), JSON.stringify(t.raw || {}), r.awb]);
+        await pool.query(`UPDATE shipments_ops SET delivered=$1, last_status=$2, last_state=$3, history=$4::jsonb, raw_data=$5::jsonb, last_checked_at=NOW() WHERE awb=$6`, [t.delivered, t.status, resolveShipmentState(t.status, t.history), JSON.stringify(t.history || []), JSON.stringify(t.raw || {}), r.awb]);
       } else {
         await pool.query(`UPDATE shipments_ops SET last_checked_at=NOW() WHERE awb=$1`, [r.awb]);
       }
       
-      await new Promise(res => setTimeout(res, 2000));
+      // 🟢 STEP 4: The 5-second "Be Polite" delay
+      await new Promise(res => setTimeout(res, 5000));
     }
   } catch (e) { 
-    logEvent('ERROR', 'SYNC', 'Stale Update Loop Failed', { error: e.message }); 
+    logEvent('ERROR', 'SYNC', 'Stale Loop Failed', { error: e.message }); 
   }
 }
 
