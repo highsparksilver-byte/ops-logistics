@@ -454,7 +454,7 @@ async function updateStaleShipments() {
         (last_state = 'RTO' AND last_checked_at < NOW() - INTERVAL '24 hours')
       )
       ORDER BY last_checked_at ASC NULLS FIRST
-      LIMIT 50
+      LIMIT 25
     `);
     
     if (rows.length > 0) logEvent('INFO', 'WATCHDOG', `Checking ${rows.length} stale orders...`);
@@ -677,10 +677,10 @@ app.post("/track/customer", async (req, res) => {
       
       const lastCheck = row.last_checked_at ? new Date(row.last_checked_at).getTime() : 0;
       
-      // 🟢 THE FIX: Increased cooldown to 30 mins (30 * 60 * 1000) & blocked TEST/fake AWBs
+      // 🟢 THE FIX: Increased cooldown to 30 mins & blocked TEST AWBs
       const isTestAwb = row.awb.toUpperCase().includes('TEST') || row.awb.length < 5;
       
-      if (!isTestAwb && Date.now() - lastCheck > 30 * 60 * 1000) { 
+      if (!isTestAwb && Date.now() - lastCheck > 30 * 60 * 1000) {  // 🟢 Changed from 60 * 1000
         const fresh = await forceRefreshShipment(row.awb, row.courier_source);
         if (fresh) {
            row.last_state = resolveShipmentState(fresh.status, fresh.history);
@@ -922,22 +922,20 @@ app.get("/admin/debug-returns", async (req, res) => {
 });
 
 /* ===============================
-   🚀 DEEP SYNC (JAN 1st TO PRESENT - UNLIMITED)
+   🚀 DEEP SYNC (LAST 1000 ORDERS ONLY)
 ================================ */
 app.get("/admin/deep-sync", async (req, res) => {
   if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
 
   try {
-    // 🟢 Hardcoded to January 1st of the current year
-    const minDate = new Date(new Date().getFullYear(), 0, 1).toISOString(); 
+    logEvent('INFO', 'DEEP_SYNC', `Starting Deep Sync for the last 500 orders...`);
 
-    logEvent('INFO', 'DEEP_SYNC', `Starting Deep Sync from ${minDate} for ALL orders...`);
-
-    let url = `https://${clean(SHOP_NAME)}.myshopify.com/admin/api/${API_VER}/orders.json?status=any&limit=250&updated_at_min=${minDate}`;
+    // Removed the Jan 1st date filter so it just pulls the most recent ones
+    let url = `https://${clean(SHOP_NAME)}.myshopify.com/admin/api/${API_VER}/orders.json?status=any&limit=250`;
     let totalSynced = 0;
 
-    // 🟢 Removed the 1000/3000 limit. It will run until every single page is done.
-    while (url) {
+    // 🟢 THE FIX: Loop stops exactly at 1000
+    while (url && totalSynced < 1000) {
        const r = await axios.get(url, { 
          headers: { "X-Shopify-Access-Token": clean(SHOPIFY_ACCESS_TOKEN) } 
        });
@@ -947,6 +945,8 @@ app.get("/admin/deep-sync", async (req, res) => {
 
        for (const o of orders) {
          await syncOrder(o);
+         // 🟢 THE FIX: 50ms breather so your PostgreSQL DB doesn't lock up
+         await new Promise(resolve => setTimeout(resolve, 50)); 
        }
        
        totalSynced += orders.length;
@@ -963,7 +963,7 @@ app.get("/admin/deep-sync", async (req, res) => {
     }
 
     logEvent('INFO', 'DEEP_SYNC', `Deep Sync Complete. Total Orders: ${totalSynced}`);
-    res.json({ success: true, count: totalSynced, message: `Successfully synced all ${totalSynced} orders since Jan 1st.` });
+    res.json({ success: true, count: totalSynced, message: `Successfully synced the latest ${totalSynced} orders.` });
 
   } catch (e) {
     logEvent('ERROR', 'DEEP_SYNC', 'Failed', { error: e.message });
