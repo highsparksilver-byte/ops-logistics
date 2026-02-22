@@ -67,6 +67,16 @@ pool.query(`
   );
 `).catch(e => console.log("API Table Setup Note: " + e.message));
 
+// 🟢 RETURNS OPS SCHEMA CREATION (THE FIX)
+pool.query(`
+  CREATE TABLE IF NOT EXISTS returns_ops (
+    return_id VARCHAR(255) PRIMARY KEY,
+    order_number VARCHAR(255),
+    status VARCHAR(255),
+    updated_at TIMESTAMP DEFAULT NOW()
+  );
+`).catch(e => console.log("Returns Table Setup Note: " + e.message));
+
 /* ===============================
    🕒 DATE HELPERS
 ================================ */
