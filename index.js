@@ -621,13 +621,23 @@ app.post("/webhooks/orders_updated", (req, res) => {
 app.post("/webhooks/returnprime", async (req, res) => {
   res.sendStatus(200); 
   const e = req.body;
-  if (!e.id || !e.order_number) return;
   
-  logEvent('INFO', 'WEBHOOK', `Return Update: ${e.order_number}`, { status: e.status });
+  // 🟢 LOG EVERYTHING: Even if it fails, we want to see the shape of the data
+  logEvent('INFO', 'WEBHOOK', `ReturnPrime Hit!`, { raw_payload: e });
+
+  // Adjusting to catch multiple possible field names Return Prime might use
+  const returnId = e.id || e.return_id || e.channel_id;
+  const orderNumber = e.order_number || e.orderId || e.order_name;
+  const returnStatus = e.status || e.return_status || "created";
+
+  if (!returnId || !orderNumber) {
+     logEvent('WARN', 'WEBHOOK', 'ReturnPrime payload missing ID or Order Number', { payload: e });
+     return;
+  }
   
   await pool.query(
     `INSERT INTO returns_ops (return_id, order_number, status, updated_at) VALUES ($1,$2,$3,NOW()) ON CONFLICT (return_id) DO UPDATE SET status=EXCLUDED.status, updated_at=NOW()`, 
-    [String(e.id), e.order_number, e.status || "created"]
+    [String(returnId), String(orderNumber), String(returnStatus)]
   );
 });
 
