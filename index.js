@@ -53,7 +53,8 @@ const clean = v => v?.replace(/\r|\n|\t/g, "").trim();
 const {
   CLIENT_ID, CLIENT_SECRET, LOGIN_ID, BD_LICENCE_KEY_TRACK, BD_LICENCE_KEY_EDD,
   SHIPROCKET_EMAIL, SHIPROCKET_PASSWORD, DATABASE_URL, SHOPIFY_WEBHOOK_SECRET,
-  SHOPIFY_ACCESS_TOKEN, SHOP_NAME, SHOPIFY_API_VERSION
+  SHOPIFY_ACCESS_TOKEN, SHOP_NAME, SHOPIFY_API_VERSION,
+  ADMIN_SECRET // 🟢 NEW
 } = process.env;
 
 const API_VER = clean(SHOPIFY_API_VERSION) || '2026-01';
@@ -171,7 +172,9 @@ function verifyShopify(req) {
 
 function verifyAdmin(req) {
   const key = req.headers["x-admin-key"] || req.query.key;
-  return key === clean(SHOPIFY_WEBHOOK_SECRET);
+  // 🟢 SECURITY UPGRADE: Prefer specific ADMIN_SECRET, fallback to Webhook Secret
+  const validKey = clean(ADMIN_SECRET) || clean(SHOPIFY_WEBHOOK_SECRET);
+  return key === validKey;
 }
 
 function checkRateLimit(ip) {
