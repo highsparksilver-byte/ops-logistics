@@ -677,8 +677,9 @@ app.post("/track/customer", async (req, res) => {
       
       const lastCheck = row.last_checked_at ? new Date(row.last_checked_at).getTime() : 0;
       
-      // 🟢 THE FIX: Increased cooldown to 30 mins & blocked TEST AWBs
-      const isTestAwb = row.awb.toUpperCase().includes('TEST') || row.awb.length < 5;
+      // 🟢 THE FIX: Safely check for TEST AWBs without crashing on nulls
+      const safeAwb = String(row.awb || "").toUpperCase();
+      const isTestAwb = safeAwb.includes('TEST') || safeAwb.length < 5;
       
       if (!isTestAwb && Date.now() - lastCheck > 30 * 60 * 1000) {  // 🟢 Changed from 60 * 1000
         const fresh = await forceRefreshShipment(row.awb, row.courier_source);
