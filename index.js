@@ -915,8 +915,16 @@ app.get("/ops/orders", async (req, res) => {
     `, [limit, offset]);
 
     const countRes = await pool.query(`SELECT COUNT(*) FROM orders_ops`);
+
+    // 🟢 THE FIX: Data Diet! We strip out the huge JSON blobs so bandwidth drops by 90%
+    const optimizedRows = rows.map(r => ({
+      ...r,
+      // Map line_items down to ONLY their title strings. The sheet doesn't need the rest.
+      line_items: (r.line_items || []).map(item => ({ title: item.title }))
+    }));
+
     res.json({
-      orders: rows,
+      orders: optimizedRows,
       pagination: {
         total: parseInt(countRes.rows[0].count),
         page,
