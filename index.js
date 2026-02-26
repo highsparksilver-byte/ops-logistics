@@ -1,9 +1,9 @@
 // ==========================================
-// 🚀 HIGHSPARK ELITE LOGISTICS MASTER (v5.0 - Egress Saver Edition)
+// 🚀 HIGHSPARK ELITE LOGISTICS MASTER (v5.1 - Egress Saver + Friend's Fixes)
 // Merged: Full feature parity from v1 + Elite Scheduler from v2
 // Upgrades: Circuit breaker, smarter EDD fallback, dedup webhook guard,
 //           graceful shutdown, detailed health endpoint, backpressure protection,
-//           Delta Sync (Egress Saver)
+//           Delta Sync (Egress Saver), Parameter Binding Bug Fix, DB Index Speedup
 // ==========================================
 
 import express from "express";
@@ -21,26 +21,23 @@ const app = express();
 const eddCache = new Map();
 const rateLimiter = new Map();
 
-// Circuit Breaker State: stops hammering APIs that are clearly down
+// Circuit Breaker State
 const circuitBreakers = {
   bluedart: { failures: 0, openUntil: 0 },
   shiprocket: { failures: 0, openUntil: 0 }
 };
-const CIRCUIT_THRESHOLD = 5;     // Open after 5 consecutive failures
-const CIRCUIT_COOLDOWN = 5 * 60 * 1000; // Re-try after 5 minutes
+const CIRCUIT_THRESHOLD = 5;
+const CIRCUIT_COOLDOWN = 5 * 60 * 1000;
 
 axios.defaults.timeout = 25000;
 
-// Reuses TCP connections - prevents ECONNRESET errors under load
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 5 });
 
-// Capture raw body for Shopify HMAC verification
 app.use(express.json({
   limit: "2mb",
   verify: (req, res, buf) => { req.rawBody = buf.toString(); }
 }));
 
-// CORS - allows Shopify storefront and Vercel frontends to call this server
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -64,7 +61,7 @@ const { Pool } = pg;
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  max: 10,                  // Connection pool cap - prevents DB overload
+  max: 10,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000
 });
@@ -78,7 +75,6 @@ pool.on('error', (err) => {
 ================================ */
 async function runMigrations() {
   const queries = [
-    // Core tables
     `CREATE TABLE IF NOT EXISTS orders_ops (
       id TEXT PRIMARY KEY, order_number TEXT, financial_status TEXT, fulfillment_status TEXT,
       total_price TEXT, payment_gateway_names JSONB, customer_name TEXT, customer_email TEXT,
@@ -104,21 +100,20 @@ async function runMigrations() {
       log_date DATE DEFAULT CURRENT_DATE, provider VARCHAR(50), calls INT DEFAULT 1,
       PRIMARY KEY (log_date, provider)
     )`,
-    // Column additions (safe, idempotent)
     `ALTER TABLE orders_ops ADD COLUMN IF NOT EXISTS shipping_address JSONB`,
     `ALTER TABLE shipments_ops ADD COLUMN IF NOT EXISTS next_check_at TIMESTAMP`,
     `ALTER TABLE shipments_ops ADD COLUMN IF NOT EXISTS history JSONB`,
     `ALTER TABLE shipments_ops ADD COLUMN IF NOT EXISTS raw_data JSONB`,
-    `ALTER TABLE orders_ops ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`, // 🟢 EGRESS SAVER: Added timestamp tracking
-    // Dedup guard for webhooks
+    `ALTER TABLE orders_ops ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`,
     `CREATE TABLE IF NOT EXISTS processed_webhooks (
       webhook_id TEXT PRIMARY KEY, processed_at TIMESTAMPTZ DEFAULT NOW()
     )`,
-    // Indexes
     `CREATE INDEX IF NOT EXISTS idx_shipments_next_check ON shipments_ops(next_check_at) WHERE delivered IS DISTINCT FROM TRUE`,
     `CREATE INDEX IF NOT EXISTS idx_orders_phone ON orders_ops(customer_phone)`,
     `CREATE INDEX IF NOT EXISTS idx_shipments_order ON shipments_ops(order_id)`,
     `CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON system_logs(timestamp DESC)`,
+    // FRIEND'S FIX 1: Activated the speed index for your database
+    `CREATE INDEX IF NOT EXISTS idx_orders_updated_at ON orders_ops(updated_at DESC)`
   ];
 
   for (const q of queries) {
@@ -137,21 +132,14 @@ function nowIST() {
 
 function getNextWorkingDate() {
   const d = nowIST();
-  
-  // If it's past 14:00 (2:00 PM) IST, the pickup rolls over to tomorrow
   if (d.getHours() >= 14) {
     d.setDate(d.getDate() + 1);
   }
-
-  // If the scheduled pickup day falls on a Sunday, push it to Monday
   if (d.getDay() === 0) {
     d.setDate(d.getDate() + 1);
   }
-
-  // Reset time to exactly midnight so BlueDart gets a perfectly clean date
   d.setHours(0, 0, 0, 0);
-
-  return `/Date(${d.getTime()})/`; 
+  return `/Date(${d.getTime()})/`;
 }
 
 /* ===============================
@@ -187,7 +175,6 @@ function verifyShopify(req) {
 
 function verifyAdmin(req) {
   const key = req.headers["x-admin-key"] || req.query.key;
-  // SECURITY UPGRADE: Prefer specific ADMIN_SECRET, fallback to Webhook Secret
   const validKey = clean(ADMIN_SECRET) || clean(SHOPIFY_WEBHOOK_SECRET);
   return key === validKey;
 }
@@ -202,7 +189,6 @@ function checkRateLimit(ip) {
   return true;
 }
 
-// Webhook dedup guard - prevents double-processing if Shopify retries
 async function isWebhookDuplicate(webhookId) {
   if (!webhookId) return false;
   try {
@@ -210,9 +196,9 @@ async function isWebhookDuplicate(webhookId) {
       `INSERT INTO processed_webhooks (webhook_id) VALUES ($1) ON CONFLICT DO NOTHING RETURNING webhook_id`,
       [webhookId]
     );
-    return r.rowCount === 0; // If nothing was inserted, it's a duplicate
+    return r.rowCount === 0;
   } catch (e) {
-    return false; // On error, allow processing
+    return false;
   }
 }
 
@@ -221,13 +207,10 @@ async function isWebhookDuplicate(webhookId) {
 ================================ */
 function resolveShipmentState(status = "", history = []) {
   let s = status.toUpperCase();
-
-  // Dig into the latest scan for hidden error states
   if (history && history.length > 0) {
     const latest = history[history.length - 1];
     if (latest?.status) s += " " + latest.status.toUpperCase();
   }
-
   if (s.includes("DELIVERED")) return "DELIVERED";
   if (s.includes("RETURN") || s.includes("RTO")) return "RTO";
   if (s.includes("FAILED") || s.includes("UNDELIVERED") || s.includes("REFUSED") ||
@@ -238,14 +221,13 @@ function resolveShipmentState(status = "", history = []) {
   return "PROCESSING";
 }
 
-// State-aware scheduling: delivered ships stop being tracked, RTO is checked rarely
 function getNextCheckDelay(state) {
   switch (state) {
-    case "DELIVERED": return null;                // Stop - no more API calls
-    case "RTO":       return 24 * 60 * 60 * 1000; // Once per day
-    case "NDR":       return 2 * 60 * 60 * 1000;  // Every 2 hours
-    case "IN_TRANSIT":return 45 * 60 * 1000;      // Every 45 minutes
-    default:          return 60 * 60 * 1000;      // 1 hour for PROCESSING
+    case "DELIVERED": return null;
+    case "RTO":       return 24 * 60 * 60 * 1000;
+    case "NDR":       return 2 * 60 * 60 * 1000;
+    case "IN_TRANSIT":return 45 * 60 * 1000;
+    default:          return 60 * 60 * 1000;
   }
 }
 
@@ -266,7 +248,7 @@ function isCircuitOpen(provider) {
   if (!cb) return false;
   if (cb.openUntil > Date.now()) return true;
   if (cb.openUntil && cb.openUntil <= Date.now()) {
-    cb.failures = 0; cb.openUntil = 0; // Auto-reset after cooldown
+    cb.failures = 0; cb.openUntil = 0;
   }
   return false;
 }
@@ -275,7 +257,6 @@ function recordApiSuccess(provider) {
   if (circuitBreakers[provider]) circuitBreakers[provider].failures = 0;
 }
 
-// Only true network-level errors should open the circuit breaker.
 const RETRYABLE_ERRORS = new Set(["ECONNRESET", "ETIMEDOUT", "ECONNABORTED", "ENOTFOUND", "ECONNREFUSED"]);
 
 function isNetworkError(e) {
@@ -283,7 +264,7 @@ function isNetworkError(e) {
 }
 
 function recordApiFailure(provider, error) {
-  if (!isNetworkError(error)) return; // Logical failures don't count
+  if (!isNetworkError(error)) return;
   const cb = circuitBreakers[provider];
   if (!cb) return;
   cb.failures++;
@@ -323,7 +304,6 @@ async function getShiprocketJwt() {
 const IGNORE_SCANS = ["BAGGED", "MANIFEST", "NETWORK", "RELIEF", "PARTIAL"];
 
 async function trackBluedart(awb, retry = false) {
-  // Ghost filter: BlueDart AWBs always start with 8 or 9, are 11 digits
   if (!/^[89]\d{10}$/.test(awb)) return null;
   if (isCircuitOpen('bluedart')) {
     logEvent('WARN', 'CIRCUIT_BREAKER', `BlueDart circuit open, skipping ${awb}`);
@@ -462,27 +442,26 @@ async function predictBluedartEDD(p) {
   try {
     const j = await getBluedartJwt();
     if (!j) return null;
-    
     await new Promise(res => setTimeout(res, Math.random() * 400 + 100));
 
     const r = await axios.post(
       "https://apigateway.bluedart.com/in/transportation/transit/v1/GetDomesticTransitTimeForPinCodeandProduct",
       {
-        pPinCodeFrom: "411022", 
-        pPinCodeTo: p, 
-        pProductCode: "A", 
+        pPinCodeFrom: "411022",
+        pPinCodeTo: p,
+        pProductCode: "A",
         pSubProductCode: "P",
-        pPudate: getNextWorkingDate(), 
-        pPickupTime: "14:00", 
+        pPudate: getNextWorkingDate(),
+        pPickupTime: "14:00",
         profile: { Api_type: "S", LicenceKey: clean(BD_LICENCE_KEY_EDD), LoginID: clean(LOGIN_ID) }
       },
       { headers: { JWTToken: j }, httpsAgent }
     );
     return r.data?.GetDomesticTransitTimeForPinCodeandProductResult?.ExpectedDateDelivery || null;
-  } catch (e) { 
+  } catch (e) {
     const errDetail = e.response?.data ? JSON.stringify(e.response.data) : e.message;
-    logEvent('ERROR', 'EDD', 'BlueDart EDD Failed', { error: errDetail }); 
-    return null; 
+    logEvent('ERROR', 'EDD', 'BlueDart EDD Failed', { error: errDetail });
+    return null;
   }
 }
 
@@ -519,7 +498,7 @@ async function syncOrder(o) {
         customer_phone      = EXCLUDED.customer_phone,
         shipping_address    = EXCLUDED.shipping_address,
         city                = EXCLUDED.city,
-        updated_at          = NOW()  -- 🟢 EGRESS SAVER: Every Shopify update gets a new timestamp
+        updated_at          = NOW()
     `, [
       String(o.id), o.name, actualFinancialStatus, o.fulfillment_status, o.total_price,
       JSON.stringify(o.payment_gateway_names || []),
@@ -550,13 +529,13 @@ async function syncOrder(o) {
 }
 
 /* ===============================
-   🚀 ELITE SCHEDULER (One job per tick, state-aware)
+   🚀 ELITE SCHEDULER
 ================================ */
 let schedulerRunning = false;
 let lastQueueSize = 0;
 
 async function schedulerLoop() {
-  if (schedulerRunning) return; // Backpressure: never overlap
+  if (schedulerRunning) return;
   schedulerRunning = true;
 
   try {
@@ -666,10 +645,8 @@ async function forceRefreshShipment(awb, courier) {
 app.post("/webhooks/orders_paid", async (req, res) => {
   res.sendStatus(200);
   if (!verifyShopify(req)) return;
-
   const webhookId = req.headers["x-shopify-webhook-id"];
   if (await isWebhookDuplicate(`paid_${webhookId}`)) return;
-
   logEvent('INFO', 'WEBHOOK', `Order Paid: ${req.body.name}`);
   syncOrder(req.body);
 });
@@ -677,13 +654,10 @@ app.post("/webhooks/orders_paid", async (req, res) => {
 app.post("/webhooks/fulfillments_create", async (req, res) => {
   res.sendStatus(200);
   if (!verifyShopify(req) || !req.body.tracking_number) return;
-
   const webhookId = req.headers["x-shopify-webhook-id"];
   if (await isWebhookDuplicate(`fulf_${webhookId}`)) return;
-
   const courier = req.body.tracking_company?.toLowerCase().includes("blue") ? "bluedart" : "shiprocket";
   logEvent('INFO', 'WEBHOOK', `Fulfillment: ${req.body.tracking_number} (${courier})`);
-
   await pool.query(`
     INSERT INTO shipments_ops (awb, order_id, courier_source, next_check_at)
     VALUES ($1, $2, $3, NOW() + (random() * interval '5 minutes'))
@@ -694,10 +668,8 @@ app.post("/webhooks/fulfillments_create", async (req, res) => {
 app.post("/webhooks/orders_cancelled", async (req, res) => {
   res.sendStatus(200);
   if (!verifyShopify(req)) return;
-
   const webhookId = req.headers["x-shopify-webhook-id"];
   if (await isWebhookDuplicate(`cancel_${webhookId}`)) return;
-
   logEvent('INFO', 'WEBHOOK', `Order Cancelled: ${req.body.name}`);
   await pool.query(
     `UPDATE orders_ops SET financial_status = 'cancelled', updated_at = NOW() WHERE id = $1`,
@@ -708,10 +680,8 @@ app.post("/webhooks/orders_cancelled", async (req, res) => {
 app.post("/webhooks/orders_updated", async (req, res) => {
   res.sendStatus(200);
   if (!verifyShopify(req)) return;
-
   const webhookId = req.headers["x-shopify-webhook-id"];
   if (await isWebhookDuplicate(`upd_${webhookId}`)) return;
-
   logEvent('INFO', 'WEBHOOK', `Order Updated: ${req.body.name}`);
   syncOrder(req.body);
 });
@@ -735,7 +705,6 @@ app.post("/webhooks/returnprime", async (req, res) => {
       VALUES ($1, $2, $3, NOW())
       ON CONFLICT (return_id) DO UPDATE SET status = EXCLUDED.status, updated_at = NOW()
     `, [String(returnId), String(orderNumber), String(returnStatus)]);
-
     logEvent('INFO', 'WEBHOOK', `ReturnPrime: ${orderNumber} → ${returnStatus}`);
   } catch (e) {
     logEvent('ERROR', 'WEBHOOK', `ReturnPrime DB Error`, { error: e.message });
@@ -769,11 +738,9 @@ app.post("/track/customer", async (req, res) => {
 
     const refreshed = await Promise.all(rows.map(async (row) => {
       if (!row.awb || row.last_state === 'DELIVERED') return row;
-
       const safeAwb = String(row.awb || "").toUpperCase();
       const isTestAwb = safeAwb.includes('TEST') || safeAwb.length < 5;
       const lastCheck = row.last_checked_at ? new Date(row.last_checked_at).getTime() : 0;
-
       if (!isTestAwb && Date.now() - lastCheck > 30 * 60 * 1000) {
         const fresh = await forceRefreshShipment(row.awb, row.courier_source);
         if (fresh) {
@@ -868,18 +835,14 @@ app.get("/ops/orders", async (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const limit = Math.min(parseInt(req.query.limit) || 50, 250);
     const offset = (page - 1) * limit;
-    
-    // 🟢 EGRESS SAVER: Dynamic SQL Filtering
-    let whereClause = "";
-    let queryArgs = [limit, offset];
-    let countArgs = [];
 
-    // If Google Apps Script sends the time of its last sync, apply the filter!
+    let whereClause = "";
+    let queryArgs = [limit, offset];      
+
+    // FRIEND'S FIX 2: We use $3 for the main query, and $1 for the count query later
     if (req.query.updated_after) {
-      // Return the row if the Order was updated, the tracking status was updated, or a Return was processed since the last run
       whereClause = `WHERE o.updated_at >= $3 OR s.last_checked_at >= $3 OR r.updated_at >= $3`;
       queryArgs.push(req.query.updated_after);
-      countArgs.push(req.query.updated_after);
     }
 
     const { rows } = await pool.query(`
@@ -913,15 +876,21 @@ app.get("/ops/orders", async (req, res) => {
       LIMIT $1 OFFSET $2
     `, queryArgs);
 
-    const countRes = await pool.query(`
-      SELECT COUNT(*) 
-      FROM orders_ops o
-      LEFT JOIN shipments_ops s ON s.order_id::text = o.id::text
-      LEFT JOIN returns_ops r ON r.order_number::text = o.order_number::text
-      ${whereClause}
-    `, countArgs);
+    // FRIEND'S FIX 3: Safe, fast count query separated out
+    let countRes;
+    
+    if (req.query.updated_after) {
+      countRes = await pool.query(`
+        SELECT COUNT(*)
+        FROM orders_ops o
+        LEFT JOIN shipments_ops s ON s.order_id::text = o.id::text
+        LEFT JOIN returns_ops r ON r.order_number::text = o.order_number::text
+        WHERE o.updated_at >= $1 OR s.last_checked_at >= $1 OR r.updated_at >= $1
+      `, [req.query.updated_after]); 
+    } else {
+      countRes = await pool.query(`SELECT COUNT(*) FROM orders_ops`);
+    }
 
-    // 🟢 ALREADY GREAT: Data Diet! You strip out the huge JSON blobs here.
     const optimizedRows = rows.map(r => ({
       ...r,
       line_items: (r.line_items || []).map(item => ({ title: item.title }))
@@ -1043,11 +1012,10 @@ app.get("/admin/force-single", async (req, res) => {
 });
 
 /* ===============================
-   🚀 DEEP SYNC (Unlimited from Jan 1, 2026)
+   🚀 DEEP SYNC
 ================================ */
 app.get("/admin/deep-sync", async (req, res) => {
   if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
-
   res.json({ message: "Deep sync started from Jan 1, 2026. Check Render logs for progress." });
 
   (async () => {
@@ -1088,7 +1056,6 @@ app.get("/admin/deep-sync", async (req, res) => {
 ================================ */
 app.get("/ops/refresh-logistics", async (req, res) => {
   if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
-
   res.json({ message: "Background mass-refresh started. Up to 500 packages. Check back in ~15 mins." });
 
   (async () => {
@@ -1098,14 +1065,11 @@ app.get("/ops/refresh-logistics", async (req, res) => {
         WHERE (delivered = FALSE OR delivered IS NULL)
         ORDER BY last_checked_at ASC NULLS FIRST LIMIT 500
       `);
-
       logEvent('INFO', 'RECOVERY', `Background sweep started for ${rows.length} shipments`);
-
       for (const r of rows) {
         await forceRefreshShipment(r.awb, r.courier_source);
         await new Promise(resolve => setTimeout(resolve, 2000));
       }
-
       logEvent('INFO', 'RECOVERY', `Background sweep finished`);
     } catch (e) {
       logEvent('ERROR', 'RECOVERY', 'Sweep crashed', { error: e.message });
@@ -1164,7 +1128,7 @@ setInterval(() => {
 }, 60 * 60 * 1000);
 
 /* ===============================
-   🏥 HEALTH ENDPOINT (Detailed)
+   🏥 HEALTH ENDPOINT
 ================================ */
 app.get("/health", async (req, res) => {
   try {
@@ -1191,7 +1155,7 @@ app.get("/health", async (req, res) => {
 ================================ */
 async function shutdown(signal) {
   console.log(`\n${signal} received. Shutting down gracefully...`);
-  if (schedulerInterval) clearTimeout(schedulerInterval); 
+  if (schedulerInterval) clearTimeout(schedulerInterval);
   await pool.end();
   console.log("✅ DB pool closed. Exiting.");
   process.exit(0);
@@ -1206,7 +1170,7 @@ const PORT = process.env.PORT || 10000;
 
 (async () => {
   await runMigrations();
-  setTimeout(runBackfill, 5000);  
-  startScheduler();               
-  app.listen(PORT, () => console.log(`🚀 HighSpark Logistics Master v5.0 LIVE on :${PORT}`));
+  setTimeout(runBackfill, 5000);
+  startScheduler();
+  app.listen(PORT, () => console.log(`🚀 HighSpark Logistics Master v5.1 LIVE on :${PORT}`));
 })();
