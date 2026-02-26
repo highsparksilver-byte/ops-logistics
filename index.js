@@ -1040,18 +1040,21 @@ app.get("/admin/force-single", async (req, res) => {
 });
 
 /* ===============================
-   🚀 DEEP SYNC (Last 1000 orders from Shopify)
+   🚀 DEEP SYNC (Unlimited from Jan 1, 2026)
 ================================ */
 app.get("/admin/deep-sync", async (req, res) => {
   if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
 
-  res.json({ message: "Deep sync started. Check /ops/logs for progress." });
+  res.json({ message: "Deep sync started from Jan 1, 2026. Check Render logs for progress." });
 
   (async () => {
-    let url = `https://${clean(SHOP_NAME)}.myshopify.com/admin/api/${API_VER}/orders.json?status=any&limit=250`;
+    // 🟢 Hardcoded to grab everything from Jan 1, 2026 onward
+    const minDate = new Date("2026-01-01T00:00:00Z").toISOString();
+    let url = `https://${clean(SHOP_NAME)}.myshopify.com/admin/api/${API_VER}/orders.json?status=any&limit=250&updated_at_min=${minDate}`;
     let totalSynced = 0;
 
-    while (url && totalSynced < 1000) {
+    // 🟢 Removed the < 1000 cap. It will loop until it reaches today.
+    while (url) {
       try {
         const r = await axios.get(url, { headers: { "X-Shopify-Access-Token": clean(SHOPIFY_ACCESS_TOKEN) } });
         const orders = r.data.orders || [];
@@ -1064,6 +1067,7 @@ app.get("/admin/deep-sync", async (req, res) => {
 
         totalSynced += orders.length;
         logEvent('INFO', 'DEEP_SYNC', `Progress: ${totalSynced} orders`);
+        console.log(`✅ Synced ${totalSynced} orders so far...`);
 
         const link = r.headers.link || '';
         const match = link.match(/<([^>]+)>;\s*rel="next"/);
@@ -1073,7 +1077,8 @@ app.get("/admin/deep-sync", async (req, res) => {
         break;
       }
     }
-    logEvent('INFO', 'DEEP_SYNC', `Complete: ${totalSynced} orders synced`);
+    logEvent('INFO', 'DEEP_SYNC', `Complete: ${totalSynced} orders synced from Jan 1st.`);
+    console.log(`🎉 DEEP SYNC COMPLETE. Total: ${totalSynced} orders.`);
   })();
 });
 
