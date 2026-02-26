@@ -38,6 +38,12 @@ app.use(express.json({
   verify: (req, res, buf) => { req.rawBody = buf.toString(); }
 }));
 
+// 📢 THE DOORBELL: This will print every incoming request to your Render logs
+app.use((req, res, next) => {
+  console.log(`🔔 Incoming: ${req.method} ${req.path} from ${req.ip}`);
+  next();
+});
+
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
