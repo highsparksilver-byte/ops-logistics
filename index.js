@@ -1,8 +1,9 @@
 // ==========================================
-// 🚀 HIGHSPARK ELITE LOGISTICS MASTER (v4.0)
+// 🚀 HIGHSPARK ELITE LOGISTICS MASTER (v5.0 - Egress Saver Edition)
 // Merged: Full feature parity from v1 + Elite Scheduler from v2
 // Upgrades: Circuit breaker, smarter EDD fallback, dedup webhook guard,
-//           graceful shutdown, detailed health endpoint, backpressure protection
+//           graceful shutdown, detailed health endpoint, backpressure protection,
+//           Delta Sync (Egress Saver)
 // ==========================================
 
 import express from "express";
@@ -20,7 +21,7 @@ const app = express();
 const eddCache = new Map();
 const rateLimiter = new Map();
 
-// 🆕 Circuit Breaker State: stops hammering APIs that are clearly down
+// Circuit Breaker State: stops hammering APIs that are clearly down
 const circuitBreakers = {
   bluedart: { failures: 0, openUntil: 0 },
   shiprocket: { failures: 0, openUntil: 0 }
@@ -54,7 +55,7 @@ const {
   CLIENT_ID, CLIENT_SECRET, LOGIN_ID, BD_LICENCE_KEY_TRACK, BD_LICENCE_KEY_EDD,
   SHIPROCKET_EMAIL, SHIPROCKET_PASSWORD, DATABASE_URL, SHOPIFY_WEBHOOK_SECRET,
   SHOPIFY_ACCESS_TOKEN, SHOP_NAME, SHOPIFY_API_VERSION,
-  ADMIN_SECRET // 🟢 NEW
+  ADMIN_SECRET
 } = process.env;
 
 const API_VER = clean(SHOPIFY_API_VERSION) || '2026-01';
@@ -63,7 +64,7 @@ const { Pool } = pg;
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  max: 10,                  // 🆕 Connection pool cap - prevents DB overload
+  max: 10,                  // Connection pool cap - prevents DB overload
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000
 });
@@ -108,7 +109,8 @@ async function runMigrations() {
     `ALTER TABLE shipments_ops ADD COLUMN IF NOT EXISTS next_check_at TIMESTAMP`,
     `ALTER TABLE shipments_ops ADD COLUMN IF NOT EXISTS history JSONB`,
     `ALTER TABLE shipments_ops ADD COLUMN IF NOT EXISTS raw_data JSONB`,
-    // 🆕 Dedup guard for webhooks
+    `ALTER TABLE orders_ops ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`, // 🟢 EGRESS SAVER: Added timestamp tracking
+    // Dedup guard for webhooks
     `CREATE TABLE IF NOT EXISTS processed_webhooks (
       webhook_id TEXT PRIMARY KEY, processed_at TIMESTAMPTZ DEFAULT NOW()
     )`,
@@ -136,7 +138,7 @@ function nowIST() {
 function getNextWorkingDate() {
   const d = nowIST();
   
-  // 🟢 THE FIX: If it's past 14:00 (2:00 PM) IST, the pickup rolls over to tomorrow
+  // If it's past 14:00 (2:00 PM) IST, the pickup rolls over to tomorrow
   if (d.getHours() >= 14) {
     d.setDate(d.getDate() + 1);
   }
@@ -185,7 +187,7 @@ function verifyShopify(req) {
 
 function verifyAdmin(req) {
   const key = req.headers["x-admin-key"] || req.query.key;
-  // 🟢 SECURITY UPGRADE: Prefer specific ADMIN_SECRET, fallback to Webhook Secret
+  // SECURITY UPGRADE: Prefer specific ADMIN_SECRET, fallback to Webhook Secret
   const validKey = clean(ADMIN_SECRET) || clean(SHOPIFY_WEBHOOK_SECRET);
   return key === validKey;
 }
@@ -200,7 +202,7 @@ function checkRateLimit(ip) {
   return true;
 }
 
-// 🆕 Webhook dedup guard - prevents double-processing if Shopify retries
+// Webhook dedup guard - prevents double-processing if Shopify retries
 async function isWebhookDuplicate(webhookId) {
   if (!webhookId) return false;
   try {
@@ -236,7 +238,7 @@ function resolveShipmentState(status = "", history = []) {
   return "PROCESSING";
 }
 
-// 🆕 State-aware scheduling: delivered ships stop being tracked, RTO is checked rarely
+// State-aware scheduling: delivered ships stop being tracked, RTO is checked rarely
 function getNextCheckDelay(state) {
   switch (state) {
     case "DELIVERED": return null;                // Stop - no more API calls
@@ -274,8 +276,6 @@ function recordApiSuccess(provider) {
 }
 
 // Only true network-level errors should open the circuit breaker.
-// Logical failures (bad XML, invalid AWB, empty response) are NOT counted —
-// they mean the API is up, just the AWB/data is bad.
 const RETRYABLE_ERRORS = new Set(["ECONNRESET", "ETIMEDOUT", "ECONNABORTED", "ENOTFOUND", "ECONNREFUSED"]);
 
 function isNetworkError(e) {
@@ -348,7 +348,6 @@ async function trackBluedart(awb, retry = false) {
     try {
       p = await xml2js.parseStringPromise(r.data, { explicitArray: false });
     } catch (parseErr) {
-      // XML parse failure = logical error (API is up, data is malformed) — do NOT trip circuit breaker
       logEvent('WARN', 'TRACKING', 'BlueDart XML parse failed', { awb, error: parseErr.message });
       return null;
     }
@@ -356,7 +355,6 @@ async function trackBluedart(awb, retry = false) {
     const shipments = p?.ShipmentData?.Shipment;
     if (!shipments) return null;
 
-    // Handle Array (RTO has 2 shipment legs) vs Object (normal forward only)
     const fwd = Array.isArray(shipments) ? shipments[0] : shipments;
     const ret = Array.isArray(shipments) && shipments.length > 1 ? shipments[1] : null;
 
@@ -394,7 +392,6 @@ async function trackBluedart(awb, retry = false) {
       raw: p
     };
   } catch (e) {
-    // Retry on transient network errors (not on logical failures like bad XML)
     if (e.code && RETRYABLE_ERRORS.has(e.code) && !retry) {
       await new Promise(res => setTimeout(res, 2000));
       return trackBluedart(awb, true);
@@ -422,7 +419,6 @@ async function trackShiprocket(awb) {
       validateStatus: (s) => s < 600
     });
 
-    // Handle cancelled AWBs gracefully
     const errorMsg = r.data?.message || JSON.stringify(r.data);
     if (errorMsg.includes("cancelled") || errorMsg.includes("canceled")) {
       return { status: "CANCELLED", delivered: false, history: [], raw: r.data };
@@ -460,14 +456,13 @@ async function getCity(p) {
 }
 
 /* ===============================
-   🚚 EDD ENGINE (BlueDart primary, Shiprocket fallback)
+   🚚 EDD ENGINE
 ================================ */
 async function predictBluedartEDD(p) {
   try {
     const j = await getBluedartJwt();
     if (!j) return null;
     
-    // Optional: Keep the jitter to prevent rate limits colliding with the watchdog
     await new Promise(res => setTimeout(res, Math.random() * 400 + 100));
 
     const r = await axios.post(
@@ -478,14 +473,13 @@ async function predictBluedartEDD(p) {
         pProductCode: "A", 
         pSubProductCode: "P",
         pPudate: getNextWorkingDate(), 
-        pPickupTime: "14:00", // 🟢 Ensure this explicitly says "14:00"
+        pPickupTime: "14:00", 
         profile: { Api_type: "S", LicenceKey: clean(BD_LICENCE_KEY_EDD), LoginID: clean(LOGIN_ID) }
       },
       { headers: { JWTToken: j }, httpsAgent }
     );
     return r.data?.GetDomesticTransitTimeForPinCodeandProductResult?.ExpectedDateDelivery || null;
   } catch (e) { 
-    // Upgraded error logger to catch the exact reason BlueDart rejects it
     const errDetail = e.response?.data ? JSON.stringify(e.response.data) : e.message;
     logEvent('ERROR', 'EDD', 'BlueDart EDD Failed', { error: errDetail }); 
     return null; 
@@ -516,15 +510,16 @@ async function syncOrder(o) {
       INSERT INTO orders_ops (
         id, order_number, financial_status, fulfillment_status, total_price,
         payment_gateway_names, customer_name, customer_email, customer_phone,
-        city, shipping_address, line_items, is_exchange, is_return, source, created_at
+        city, shipping_address, line_items, is_exchange, is_return, source, created_at, updated_at
       )
-      VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13, $14, $15, $16)
+      VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13, $14, $15, $16, NOW())
       ON CONFLICT (id) DO UPDATE SET
         financial_status    = EXCLUDED.financial_status,
         fulfillment_status  = EXCLUDED.fulfillment_status,
         customer_phone      = EXCLUDED.customer_phone,
         shipping_address    = EXCLUDED.shipping_address,
-        city                = EXCLUDED.city
+        city                = EXCLUDED.city,
+        updated_at          = NOW()  -- 🟢 EGRESS SAVER: Every Shopify update gets a new timestamp
     `, [
       String(o.id), o.name, actualFinancialStatus, o.fulfillment_status, o.total_price,
       JSON.stringify(o.payment_gateway_names || []),
@@ -565,7 +560,6 @@ async function schedulerLoop() {
   schedulerRunning = true;
 
   try {
-    // Peek at queue depth to drive adaptive tick speed
     const countRes = await pool.query(`
       SELECT COUNT(*) FROM shipments_ops
       WHERE delivered IS DISTINCT FROM TRUE
@@ -588,7 +582,6 @@ async function schedulerLoop() {
     const job = rows[0];
     const safeAwb = String(job.awb || "");
 
-    // Ghost AWB filter
     const isInvalidBD = job.courier_source === "bluedart" && !/^[89]\d{10}$/.test(safeAwb);
     if (isInvalidBD || safeAwb.toUpperCase().includes('TEST') || safeAwb.length < 5) {
       await pool.query(`UPDATE shipments_ops SET next_check_at = NULL, last_status = 'INVALID_AWB' WHERE awb = $1`, [job.awb]);
@@ -620,7 +613,6 @@ async function schedulerLoop() {
         logEvent('INFO', 'SCHEDULER', `✅ Delivered & stopped tracking: ${job.awb}`);
       }
     } else {
-      // API failed: back off 2 hours to avoid hammering a broken endpoint
       await pool.query(`UPDATE shipments_ops SET next_check_at = NOW() + INTERVAL '2 hours' WHERE awb = $1`, [job.awb]);
     }
   } catch (e) {
@@ -630,24 +622,20 @@ async function schedulerLoop() {
   schedulerRunning = false;
 }
 
-// Adaptive scheduler: 3s tick for large queues (>20), 10s for medium, 30s when idle
 let schedulerInterval = null;
 function startScheduler() {
   if (schedulerInterval) clearInterval(schedulerInterval);
 
   async function adaptiveTick() {
     await schedulerLoop();
-    // After each job, recalculate how fast to fire next tick
     const nextDelay = lastQueueSize > 20 ? 3000 : lastQueueSize > 5 ? 10000 : 30000;
     schedulerInterval = setTimeout(adaptiveTick, nextDelay);
   }
-
-  // Kick off the first tick
   schedulerInterval = setTimeout(adaptiveTick, 5000);
 }
 
 /* ===============================
-   ⚡️ LIVE REFRESH (Admin / Customer trigger)
+   ⚡️ LIVE REFRESH
 ================================ */
 async function forceRefreshShipment(awb, courier) {
   if (!awb) return null;
@@ -712,7 +700,7 @@ app.post("/webhooks/orders_cancelled", async (req, res) => {
 
   logEvent('INFO', 'WEBHOOK', `Order Cancelled: ${req.body.name}`);
   await pool.query(
-    `UPDATE orders_ops SET financial_status = 'cancelled' WHERE id = $1`,
+    `UPDATE orders_ops SET financial_status = 'cancelled', updated_at = NOW() WHERE id = $1`,
     [String(req.body.id)]
   );
 });
@@ -779,7 +767,6 @@ app.post("/track/customer", async (req, res) => {
       ORDER BY o.created_at DESC LIMIT 5
     `, [phoneQuery, cleanInput]);
 
-    // Live-refresh stale entries (older than 30 min) without blocking
     const refreshed = await Promise.all(rows.map(async (row) => {
       if (!row.awb || row.last_state === 'DELIVERED') return row;
 
@@ -807,7 +794,6 @@ app.post("/track/customer", async (req, res) => {
 
       let currentState = row.last_state || (row.fulfillment_status === 'fulfilled' ? "IN_TRANSIT" : "PROCESSING");
 
-      // Multi-layer cancellation check
       const historyStr = JSON.stringify(row.db_history || []).toUpperCase();
       if (
         row.financial_status === 'cancelled' ||
@@ -866,7 +852,6 @@ app.post("/edd", async (req, res) => {
 
   const EDD_CACHE_MAX = 500;
   if (eddCache.size >= EDD_CACHE_MAX) {
-    // Evict the oldest entry (Maps preserve insertion order)
     eddCache.delete(eddCache.keys().next().value);
   }
   eddCache.set(pincode, data);
@@ -874,15 +859,28 @@ app.post("/edd", async (req, res) => {
 });
 
 /* ===============================
-   ✅ PAGINATED ORDERS ENDPOINT (OPS)
+   ✅ PAGINATED ORDERS ENDPOINT (OPS) - 🟢 EGRESS PROTECTED
 ================================ */
 app.get("/ops/orders", async (req, res) => {
   if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
 
   try {
     const page = parseInt(req.query.page) || 1;
-    const limit = Math.min(parseInt(req.query.limit) || 50, 250); // Cap at 250
+    const limit = Math.min(parseInt(req.query.limit) || 50, 250);
     const offset = (page - 1) * limit;
+    
+    // 🟢 EGRESS SAVER: Dynamic SQL Filtering
+    let whereClause = "";
+    let queryArgs = [limit, offset];
+    let countArgs = [];
+
+    // If Google Apps Script sends the time of its last sync, apply the filter!
+    if (req.query.updated_after) {
+      // Return the row if the Order was updated, the tracking status was updated, or a Return was processed since the last run
+      whereClause = `WHERE o.updated_at >= $3 OR s.last_checked_at >= $3 OR r.updated_at >= $3`;
+      queryArgs.push(req.query.updated_after);
+      countArgs.push(req.query.updated_after);
+    }
 
     const { rows } = await pool.query(`
       SELECT
@@ -910,16 +908,22 @@ app.get("/ops/orders", async (req, res) => {
       FROM orders_ops o
       LEFT JOIN shipments_ops s ON s.order_id::text = o.id::text
       LEFT JOIN returns_ops r ON r.order_number::text = o.order_number::text
+      ${whereClause}
       ORDER BY o.created_at DESC
       LIMIT $1 OFFSET $2
-    `, [limit, offset]);
+    `, queryArgs);
 
-    const countRes = await pool.query(`SELECT COUNT(*) FROM orders_ops`);
+    const countRes = await pool.query(`
+      SELECT COUNT(*) 
+      FROM orders_ops o
+      LEFT JOIN shipments_ops s ON s.order_id::text = o.id::text
+      LEFT JOIN returns_ops r ON r.order_number::text = o.order_number::text
+      ${whereClause}
+    `, countArgs);
 
-    // 🟢 THE FIX: Data Diet! We strip out the huge JSON blobs so bandwidth drops by 90%
+    // 🟢 ALREADY GREAT: Data Diet! You strip out the huge JSON blobs here.
     const optimizedRows = rows.map(r => ({
       ...r,
-      // Map line_items down to ONLY their title strings. The sheet doesn't need the rest.
       line_items: (r.line_items || []).map(item => ({ title: item.title }))
     }));
 
@@ -1013,7 +1017,6 @@ app.get("/admin/debug-returns", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 🆕 Circuit breaker status - useful for diagnosing API issues
 app.get("/admin/circuit-status", async (req, res) => {
   if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
   const status = {};
@@ -1048,12 +1051,10 @@ app.get("/admin/deep-sync", async (req, res) => {
   res.json({ message: "Deep sync started from Jan 1, 2026. Check Render logs for progress." });
 
   (async () => {
-    // 🟢 Hardcoded to grab everything from Jan 1, 2026 onward
     const minDate = new Date("2026-01-01T00:00:00Z").toISOString();
     let url = `https://${clean(SHOP_NAME)}.myshopify.com/admin/api/${API_VER}/orders.json?status=any&limit=250&updated_at_min=${minDate}`;
     let totalSynced = 0;
 
-    // 🟢 Removed the < 1000 cap. It will loop until it reaches today.
     while (url) {
       try {
         const r = await axios.get(url, { headers: { "X-Shopify-Access-Token": clean(SHOPIFY_ACCESS_TOKEN) } });
@@ -1142,23 +1143,19 @@ async function runSafetyNet() {
   } catch (e) { logEvent('ERROR', 'SAFETY_NET', 'Safety Net Failed', { error: e.message }); }
 }
 
-// Safety Net: Every 12 hours
 cron.schedule('0 */12 * * *', runSafetyNet);
 
-// Clear EDD Cache daily at 14:10 IST (product prices / serviceability change)
 cron.schedule('10 14 * * *', () => {
   eddCache.clear();
   logEvent('INFO', 'CACHE', 'EDD Cache cleared at 14:10 IST');
 }, { scheduled: true, timezone: "Asia/Kolkata" });
 
-// 🆕 Cleanup old webhook dedup records (older than 7 days)
 cron.schedule('0 3 * * *', async () => {
   await pool.query(`DELETE FROM processed_webhooks WHERE processed_at < NOW() - INTERVAL '7 days'`).catch(console.error);
   await pool.query(`DELETE FROM system_logs WHERE timestamp < NOW() - INTERVAL '30 days'`).catch(console.error);
   logEvent('INFO', 'CLEANUP', 'Old logs and webhook records pruned');
 });
 
-// Rate limiter: prune only expired entries (>60s old) to preserve active blocks
 setInterval(() => {
   const now = Date.now();
   for (const [ip, r] of rateLimiter.entries()) {
@@ -1194,7 +1191,7 @@ app.get("/health", async (req, res) => {
 ================================ */
 async function shutdown(signal) {
   console.log(`\n${signal} received. Shutting down gracefully...`);
-  if (schedulerInterval) clearTimeout(schedulerInterval); // adaptive scheduler uses setTimeout
+  if (schedulerInterval) clearTimeout(schedulerInterval); 
   await pool.end();
   console.log("✅ DB pool closed. Exiting.");
   process.exit(0);
@@ -1209,7 +1206,7 @@ const PORT = process.env.PORT || 10000;
 
 (async () => {
   await runMigrations();
-  setTimeout(runBackfill, 5000);  // Initial seed after startup
-  startScheduler();               // Elite queue scheduler
-  app.listen(PORT, () => console.log(`🚀 HighSpark Logistics Master v4.0 LIVE on :${PORT}`));
+  setTimeout(runBackfill, 5000);  
+  startScheduler();               
+  app.listen(PORT, () => console.log(`🚀 HighSpark Logistics Master v5.0 LIVE on :${PORT}`));
 })();
