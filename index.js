@@ -539,30 +539,32 @@ async function syncOrder(o) {
 ================================ */
 async function smartTrack(awb, intendedCourier) {
   let result = null;
+  let actualCourier = intendedCourier; // Assume the original is correct until proven otherwise
   const cleanAwb = String(awb || "").trim();
-  const isBdFormat = /^[89]\d{10}$/.test(cleanAwb); // Exactly 11 digits starting with 8 or 9
+  const isBdFormat = /^[89]\d{10}$/.test(cleanAwb);
 
   if (intendedCourier === "bluedart") {
-    // If it's correctly formatted for BlueDart, try BlueDart first
-    if (isBdFormat) {
-      result = await trackBluedart(cleanAwb);
-    }
+    if (isBdFormat) result = await trackBluedart(cleanAwb);
     
-    // Fallback: If BlueDart failed (null) OR it was a 13-digit Shiprocket AWB all along
+    // Fallback to Shiprocket
     if (!result) {
       console.log(`🔄 Routing Fallback: Checking Shiprocket for ${cleanAwb}`);
       result = await trackShiprocket(cleanAwb);
+      if (result) actualCourier = "shiprocket"; // 🟢 Found it! Switch the label.
     }
   } else {
-    // Intended courier is Shiprocket
     result = await trackShiprocket(cleanAwb);
     
-    // Fallback: If Shiprocket failed (null) AND it perfectly matches BlueDart's 11-digit format
+    // Fallback to BlueDart
     if (!result && isBdFormat) {
       console.log(`🔄 Routing Fallback: Checking BlueDart for ${cleanAwb}`);
       result = await trackBluedart(cleanAwb);
+      if (result) actualCourier = "bluedart"; // 🟢 Found it! Switch the label.
     }
   }
+  
+  // Attach the winning courier to the result so the database knows
+  if (result) result.actual_courier = actualCourier;
   
   return result;
 }
@@ -600,14 +602,12 @@ async function schedulerLoop() {
     const job = rows[0];
     const safeAwb = String(job.awb || "").trim();
 
-    // 🟢 REMOVED KILL SWITCH: We no longer kill mislabeled BlueDart AWBs, we let smartTrack handle them!
     if (safeAwb.toUpperCase().includes('TEST') || safeAwb.length < 5) {
       await pool.query(`UPDATE shipments_ops SET next_check_at = NULL, last_status = 'INVALID_AWB' WHERE awb = $1`, [job.awb]);
       schedulerRunning = false;
       return;
     }
 
-    // 🟢 UPGRADE: Using the new Smart Routing Engine
     const result = await smartTrack(job.awb, job.courier_source);
 
     if (result) {
@@ -615,16 +615,18 @@ async function schedulerLoop() {
       const delay = getNextCheckDelay(state);
       const nextCheck = delay ? new Date(Date.now() + delay) : null;
 
+      // 🟢 UPGRADE: Updates the courier_source ($8) if the fallback changed it!
       await pool.query(`
         UPDATE shipments_ops SET
           last_status = $1, last_state = $2, delivered = $3,
           history = $4::jsonb, raw_data = $5::jsonb,
-          next_check_at = $6, last_checked_at = NOW()
+          next_check_at = $6, last_checked_at = NOW(),
+          courier_source = $8
         WHERE awb = $7
       `, [result.status, state, result.delivered,
           JSON.stringify(result.history || []),
           JSON.stringify(result.raw || {}),
-          nextCheck, job.awb]);
+          nextCheck, job.awb, result.actual_courier]);
 
       if (result.delivered) {
         logEvent('INFO', 'SCHEDULER', `✅ Delivered & stopped tracking: ${job.awb}`);
@@ -657,22 +659,24 @@ function startScheduler() {
 async function forceRefreshShipment(awb, courier) {
   if (!awb) return null;
   
-  // 🟢 UPGRADE: Live refreshes now use the Fallback system too
   const result = await smartTrack(awb, courier);
 
   if (result) {
     const state = resolveShipmentState(result.status, result.history);
     const delay = getNextCheckDelay(state);
+    
+    // 🟢 UPGRADE: Also updates courier_source ($8) during live manual refreshes
     await pool.query(`
       UPDATE shipments_ops SET
         delivered = $1, last_status = $2, last_state = $3,
         history = $4::jsonb, raw_data = $5::jsonb,
-        next_check_at = $6, last_checked_at = NOW()
+        next_check_at = $6, last_checked_at = NOW(),
+        courier_source = $8
       WHERE awb = $7
     `, [result.delivered, result.status, state,
         JSON.stringify(result.history || []),
         JSON.stringify(result.raw || {}),
-        delay ? new Date(Date.now() + delay) : null, awb]);
+        delay ? new Date(Date.now() + delay) : null, awb, result.actual_courier]);
 
     logEvent('INFO', 'TRACKING', `Live refreshed ${awb}`, { status: result.status });
   }
