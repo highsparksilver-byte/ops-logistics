@@ -376,7 +376,8 @@ async function trackBluedart(awb, retry = false) {
         date: `${(x.ScanDate || "").trim()} ${(x.ScanTime || "00:00").trim()}`,
         location: x.ScannedLocation
       })),
-      raw: p
+      // 🟢 THE TERMINAL SCRUB: Keep full XML for active NDRs, delete it completely when Delivered/RTO.
+      raw: isFinallyDone ? {} : p 
     };
   } catch (e) {
     if (e.code && RETRYABLE_ERRORS.has(e.code) && !retry) {
@@ -431,7 +432,8 @@ async function trackShiprocket(awb) {
       history: (d.shipment_track_activities || []).map(x => ({
         status: x.activity, date: x.date, location: x.location
       })),
-      raw: d
+      // 🟢 THE TERMINAL SCRUB: If active, keep full JSON for the X-Ray tool. If Delivered/RTO, shrink it to just the tiny delivery dates your Dashboard needs.
+      raw: isTerminal ? { shipment_track: d.shipment_track || [] } : d 
     };
   } catch (e) {
     recordApiFailure('shiprocket', e);
@@ -1124,8 +1126,17 @@ app.get("/admin/deep-sync", async (req, res) => {
 /* ===============================
    🚀 LOGISTICS BATCH REFRESH
 ================================ */
+let massRefreshRunning = false; // 🟢 THE LOCK
+
 app.get("/ops/refresh-logistics", async (req, res) => {
   if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
+  
+  // 🟢 BOUNCE SPAMMERS
+  if (massRefreshRunning) {
+    return res.status(429).json({ error: "A mass-refresh is already running! Please check back in 15 minutes." });
+  }
+  
+  massRefreshRunning = true;
   res.json({ message: "Background mass-refresh started. Up to 500 packages. Check back in ~15 mins." });
 
   (async () => {
@@ -1143,6 +1154,8 @@ app.get("/ops/refresh-logistics", async (req, res) => {
       logEvent('INFO', 'RECOVERY', `Background sweep finished`);
     } catch (e) {
       logEvent('ERROR', 'RECOVERY', 'Sweep crashed', { error: e.message });
+    } finally {
+      massRefreshRunning = false; // 🟢 RELEASE THE LOCK
     }
   })();
 });
@@ -1226,12 +1239,14 @@ app.get("/health", async (req, res) => {
 async function shutdown(signal) {
   console.log(`\n${signal} received. Shutting down gracefully...`);
   if (schedulerInterval) clearTimeout(schedulerInterval);
+  
+  // 🟢 FRIEND'S FIX: Hard-unlock all advisory locks on shutdown
+  await pool.query(`SELECT pg_advisory_unlock_all()`).catch(() => {});
+  
   await pool.end();
   console.log("✅ DB pool closed. Exiting.");
   process.exit(0);
 }
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT',  () => shutdown('SIGINT'));
 
 /* ===============================
    🚀 STARTUP SEQUENCE
