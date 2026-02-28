@@ -405,20 +405,28 @@ async function trackShiprocket(awb) {
       validateStatus: (s) => s < 600
     });
 
-    const errorMsg = r.data?.message || JSON.stringify(r.data);
-    if (errorMsg.includes("cancelled") || errorMsg.includes("canceled")) {
-      return { status: "CANCELLED", delivered: false, history: [], raw: r.data };
-    }
-
     const d = r.data?.tracking_data;
     if (!d) { logEvent('WARN', 'TRACKING', 'Shiprocket Empty Response', { awb }); return null; }
 
-    const status = d.current_status || d.shipment_track?.[0]?.current_status || "";
+    // 🟢 UPGRADE: Check the deep status first! This catches "RTO Delivered" hiding under a "Cancelled" top-level flag.
+    const deepStatus = d.shipment_track?.[0]?.current_status || "";
+    const topStatus = d.current_status || "";
+    
+    let finalStatus = topStatus;
+    
+    // If the deep status says RTO or Return, trust it over a "Cancelled" top status
+    if (deepStatus.toUpperCase().includes('RTO') || deepStatus.toUpperCase().includes('RETURN')) {
+        finalStatus = deepStatus;
+    } else if (r.data?.message?.includes("cancel") || topStatus.toLowerCase().includes("cancel")) {
+        finalStatus = "CANCELLED";
+    } else if (deepStatus) {
+        finalStatus = deepStatus;
+    }
 
     recordApiSuccess('shiprocket');
     return {
-      status: status,
-      delivered: status.toUpperCase().includes("DELIVERED"),
+      status: finalStatus,
+      delivered: finalStatus.toUpperCase().includes("DELIVERED") && !finalStatus.toUpperCase().includes("RTO"),
       history: (d.shipment_track_activities || []).map(x => ({
         status: x.activity, date: x.date, location: x.location
       })),
