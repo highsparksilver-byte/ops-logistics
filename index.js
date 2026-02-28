@@ -535,6 +535,39 @@ async function syncOrder(o) {
 }
 
 /* ===============================
+   🧠 SMART ROUTING ENGINE (NEW)
+================================ */
+async function smartTrack(awb, intendedCourier) {
+  let result = null;
+  const cleanAwb = String(awb || "").trim();
+  const isBdFormat = /^[89]\d{10}$/.test(cleanAwb); // Exactly 11 digits starting with 8 or 9
+
+  if (intendedCourier === "bluedart") {
+    // If it's correctly formatted for BlueDart, try BlueDart first
+    if (isBdFormat) {
+      result = await trackBluedart(cleanAwb);
+    }
+    
+    // Fallback: If BlueDart failed (null) OR it was a 13-digit Shiprocket AWB all along
+    if (!result) {
+      console.log(`🔄 Routing Fallback: Checking Shiprocket for ${cleanAwb}`);
+      result = await trackShiprocket(cleanAwb);
+    }
+  } else {
+    // Intended courier is Shiprocket
+    result = await trackShiprocket(cleanAwb);
+    
+    // Fallback: If Shiprocket failed (null) AND it perfectly matches BlueDart's 11-digit format
+    if (!result && isBdFormat) {
+      console.log(`🔄 Routing Fallback: Checking BlueDart for ${cleanAwb}`);
+      result = await trackBluedart(cleanAwb);
+    }
+  }
+  
+  return result;
+}
+
+/* ===============================
    🚀 ELITE SCHEDULER
 ================================ */
 let schedulerRunning = false;
@@ -565,18 +598,17 @@ async function schedulerLoop() {
     if (rows.length === 0) { schedulerRunning = false; return; }
 
     const job = rows[0];
-    const safeAwb = String(job.awb || "");
+    const safeAwb = String(job.awb || "").trim();
 
-    const isInvalidBD = job.courier_source === "bluedart" && !/^[89]\d{10}$/.test(safeAwb);
-    if (isInvalidBD || safeAwb.toUpperCase().includes('TEST') || safeAwb.length < 5) {
+    // 🟢 REMOVED KILL SWITCH: We no longer kill mislabeled BlueDart AWBs, we let smartTrack handle them!
+    if (safeAwb.toUpperCase().includes('TEST') || safeAwb.length < 5) {
       await pool.query(`UPDATE shipments_ops SET next_check_at = NULL, last_status = 'INVALID_AWB' WHERE awb = $1`, [job.awb]);
       schedulerRunning = false;
       return;
     }
 
-    const result = job.courier_source === "bluedart"
-      ? await trackBluedart(job.awb)
-      : await trackShiprocket(job.awb);
+    // 🟢 UPGRADE: Using the new Smart Routing Engine
+    const result = await smartTrack(job.awb, job.courier_source);
 
     if (result) {
       const state = resolveShipmentState(result.status, result.history);
@@ -624,7 +656,9 @@ function startScheduler() {
 ================================ */
 async function forceRefreshShipment(awb, courier) {
   if (!awb) return null;
-  const result = courier === "bluedart" ? await trackBluedart(awb) : await trackShiprocket(awb);
+  
+  // 🟢 UPGRADE: Live refreshes now use the Fallback system too
+  const result = await smartTrack(awb, courier);
 
   if (result) {
     const state = resolveShipmentState(result.status, result.history);
