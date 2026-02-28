@@ -357,7 +357,8 @@ async function trackBluedart(awb, retry = false) {
     const rawScans = Array.isArray(fwd.Scans?.ScanDetail) ? fwd.Scans.ScanDetail : [fwd.Scans?.ScanDetail];
     let allScans = rawScans;
     if (ret && Array.isArray(ret.Scans?.ScanDetail)) {
-      allScans = [...ret.Scans.ScanDetail, ...allScans];
+      // 🟢 FRIEND'S FIX: Append return scans to the END so chronological order is maintained
+      allScans = [...allScans, ...ret.Scans.ScanDetail]; 
     }
 
     const scans = allScans.filter(x => {
@@ -578,7 +579,7 @@ async function smartTrack(awb, intendedCourier) {
 }
 
 /* ===============================
-   🚀 ELITE SCHEDULER
+   🚀 ELITE SCHEDULER (WITH DB LOCK)
 ================================ */
 let schedulerRunning = false;
 let lastQueueSize = 0;
@@ -586,6 +587,13 @@ let lastQueueSize = 0;
 async function schedulerLoop() {
   if (schedulerRunning) return;
   schedulerRunning = true;
+
+  // 🟢 FRIEND'S FIX: Postgres Advisory Lock (Prevents 2 Render instances from colliding)
+  const lock = await pool.query(`SELECT pg_try_advisory_lock(1042)`);
+  if (!lock.rows[0].pg_try_advisory_lock) {
+    schedulerRunning = false;
+    return; // Another instance is already running the scheduler
+  }
 
   try {
     const countRes = await pool.query(`
@@ -605,14 +613,13 @@ async function schedulerLoop() {
       LIMIT 1
     `);
 
-    if (rows.length === 0) { schedulerRunning = false; return; }
+    if (rows.length === 0) return;
 
     const job = rows[0];
     const safeAwb = String(job.awb || "").trim();
 
     if (safeAwb.toUpperCase().includes('TEST') || safeAwb.length < 5) {
       await pool.query(`UPDATE shipments_ops SET next_check_at = NULL, last_status = 'INVALID_AWB' WHERE awb = $1`, [job.awb]);
-      schedulerRunning = false;
       return;
     }
 
@@ -623,7 +630,6 @@ async function schedulerLoop() {
       const delay = getNextCheckDelay(state);
       const nextCheck = delay ? new Date(Date.now() + delay) : null;
 
-      // 🟢 UPGRADE: Updates the courier_source ($8) if the fallback changed it!
       await pool.query(`
         UPDATE shipments_ops SET
           last_status = $1, last_state = $2, delivered = $3,
@@ -636,17 +642,17 @@ async function schedulerLoop() {
           JSON.stringify(result.raw || {}),
           nextCheck, job.awb, result.actual_courier]);
 
-      if (result.delivered) {
-        logEvent('INFO', 'SCHEDULER', `✅ Delivered & stopped tracking: ${job.awb}`);
-      }
+      if (result.delivered) logEvent('INFO', 'SCHEDULER', `✅ Delivered & stopped tracking: ${job.awb}`);
     } else {
       await pool.query(`UPDATE shipments_ops SET next_check_at = NOW() + INTERVAL '2 hours' WHERE awb = $1`, [job.awb]);
     }
   } catch (e) {
     console.error("Scheduler Error:", e.message);
+  } finally {
+    // 🟢 FRIEND'S FIX: Always release the lock when done, even if it crashes!
+    await pool.query(`SELECT pg_advisory_unlock(1042)`);
+    schedulerRunning = false;
   }
-
-  schedulerRunning = false;
 }
 
 let schedulerInterval = null;
@@ -788,11 +794,17 @@ app.post("/track/customer", async (req, res) => {
       ORDER BY o.created_at DESC LIMIT 5
     `, [phoneQuery, cleanInput]);
 
-    const refreshed = await Promise.all(rows.map(async (row) => {
-      if (!row.awb || row.last_state === 'DELIVERED') return row;
+    // 🟢 FRIEND'S FIX: Sequential fetching to prevent API rate-limit bans
+    const refreshed = [];
+    for (const row of rows) {
+      if (!row.awb || row.last_state === 'DELIVERED') {
+        refreshed.push(row);
+        continue;
+      }
       const safeAwb = String(row.awb || "").toUpperCase();
       const isTestAwb = safeAwb.includes('TEST') || safeAwb.length < 5;
       const lastCheck = row.last_checked_at ? new Date(row.last_checked_at).getTime() : 0;
+      
       if (!isTestAwb && Date.now() - lastCheck > 30 * 60 * 1000) {
         const fresh = await forceRefreshShipment(row.awb, row.courier_source);
         if (fresh) {
@@ -800,10 +812,10 @@ app.post("/track/customer", async (req, res) => {
           row.last_status = fresh.status;
           row.db_history = fresh.history;
         }
+        await new Promise(r => setTimeout(r, 400)); // Breathe for 400ms between live calls!
       }
-      return row;
-    }));
-
+      refreshed.push(row);
+    }
     const results = refreshed.map(row => {
       let history = [{ status: "Ordered", date: new Date(row.created_at).toDateString(), completed: true }];
       if (row.fulfillment_status === 'fulfilled') {
@@ -921,7 +933,13 @@ app.get("/ops/orders", async (req, res) => {
         ) AS ndr_reason,
         r.status AS return_status
       FROM orders_ops o
-      LEFT JOIN shipments_ops s ON s.order_id::text = o.id::text
+      -- 🟢 FRIEND'S FIX: LATERAL JOIN picks only the newest AWB if an order has multiples
+      LEFT JOIN LATERAL (
+        SELECT * FROM shipments_ops 
+        WHERE order_id::text = o.id::text 
+        ORDER BY last_checked_at DESC NULLS LAST 
+        LIMIT 1
+      ) s ON true
       LEFT JOIN returns_ops r ON r.order_number::text = o.order_number::text
       ${whereClause}
       ORDER BY o.created_at DESC
