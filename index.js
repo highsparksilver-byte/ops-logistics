@@ -281,7 +281,7 @@ function recordApiFailure(provider, error) {
 }
 
 /* ===============================
-   📦 COURIER ENGINES
+   📦 COURIER ENGINES (WITH SUPABASE DIET)
 ================================ */
 let srJwt, srAt = 0, bdJwt, bdAt = 0;
 
@@ -376,7 +376,7 @@ async function trackBluedart(awb, retry = false) {
         date: `${(x.ScanDate || "").trim()} ${(x.ScanTime || "00:00").trim()}`,
         location: x.ScannedLocation
       })),
-      // 🟢 THE TERMINAL SCRUB: Keep full XML for active NDRs, delete it completely when Delivered/RTO.
+      // 🟢 THE TERMINAL SCRUB (SUPABASE FREE TIER SAVER)
       raw: isFinallyDone ? {} : p 
     };
   } catch (e) {
@@ -426,13 +426,15 @@ async function trackShiprocket(awb) {
     }
 
     recordApiSuccess('shiprocket');
+    const isTerminal = finalStatus.toUpperCase().includes("DELIVERED") || finalStatus.toUpperCase().includes("RTO");
+
     return {
       status: finalStatus,
       delivered: finalStatus.toUpperCase().includes("DELIVERED") && !finalStatus.toUpperCase().includes("RTO"),
       history: (d.shipment_track_activities || []).map(x => ({
         status: x.activity, date: x.date, location: x.location
       })),
-      // 🟢 THE TERMINAL SCRUB: If active, keep full JSON for the X-Ray tool. If Delivered/RTO, shrink it to just the tiny delivery dates your Dashboard needs.
+      // 🟢 THE TERMINAL SCRUB (SUPABASE FREE TIER SAVER)
       raw: isTerminal ? { shipment_track: d.shipment_track || [] } : d 
     };
   } catch (e) {
