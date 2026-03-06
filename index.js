@@ -1138,6 +1138,49 @@ app.get("/admin/deep-sync", async (req, res) => {
 });
 
 /* ===============================
+   ⚡ QUICK 2-DAY SYNC (WEEKEND FIX)
+================================ */
+app.get("/admin/quick-sync", async (req, res) => {
+  if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
+  res.json({ message: "Quick 2-day sync started. Check Render logs." });
+
+  (async () => {
+    // Get the exact time 48 hours ago
+    const d = new Date();
+    d.setDate(d.getDate() - 2);
+    const minDate = d.toISOString();
+    
+    let url = `https://${clean(SHOP_NAME)}.myshopify.com/admin/api/${API_VER}/orders.json?status=any&limit=250&updated_at_min=${minDate}`;
+    let totalSynced = 0;
+
+    while (url) {
+      try {
+        const r = await axios.get(url, { headers: { "X-Shopify-Access-Token": clean(SHOPIFY_ACCESS_TOKEN) } });
+        const orders = r.data.orders || [];
+        if (orders.length === 0) break;
+
+        for (const o of orders) {
+          await syncOrder(o);
+          await new Promise(resolve => setTimeout(resolve, 50)); // Breathe so we don't spam the DB
+        }
+
+        totalSynced += orders.length;
+        logEvent('INFO', 'QUICK_SYNC', `Progress: ${totalSynced} orders`);
+
+        const link = r.headers.link || '';
+        const match = link.match(/<([^>]+)>;\s*rel="next"/);
+        url = match ? match[1] : null;
+      } catch (e) {
+        logEvent('ERROR', 'QUICK_SYNC', 'Page failed', { error: e.message });
+        break;
+      }
+    }
+    logEvent('INFO', 'QUICK_SYNC', `Complete: ${totalSynced} orders synced from last 2 days.`);
+    console.log(`⚡ QUICK SYNC COMPLETE. Total: ${totalSynced} orders.`);
+  })();
+});
+
+/* ===============================
    🚀 LOGISTICS BATCH REFRESH
 ================================ */
 let massRefreshRunning = false; // 🟢 THE LOCK
