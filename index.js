@@ -720,11 +720,17 @@ app.post("/webhooks/fulfillments_create", async (req, res) => {
   if (await isWebhookDuplicate(`fulf_${webhookId}`)) return;
   const courier = req.body.tracking_company?.toLowerCase().includes("blue") ? "bluedart" : "shiprocket";
   logEvent('INFO', 'WEBHOOK', `Fulfillment: ${req.body.tracking_number} (${courier})`);
-  await pool.query(`
-    INSERT INTO shipments_ops (awb, order_id, courier_source, next_check_at)
-    VALUES ($1, $2, $3, NOW() + (random() * interval '5 minutes'))
-    ON CONFLICT (awb) DO NOTHING
-  `, [req.body.tracking_number, String(req.body.order_id), courier]);
+  
+  // 🟢 SAFETY NET ADDED HERE
+  try {
+    await pool.query(`
+      INSERT INTO shipments_ops (awb, order_id, courier_source, next_check_at)
+      VALUES ($1, $2, $3, NOW() + (random() * interval '5 minutes'))
+      ON CONFLICT (awb) DO NOTHING
+    `, [req.body.tracking_number, String(req.body.order_id), courier]);
+  } catch (e) {
+    logEvent('ERROR', 'WEBHOOK', 'Fulfillment DB Save Failed', { error: e.message });
+  }
 });
 
 app.post("/webhooks/orders_cancelled", async (req, res) => {
@@ -733,10 +739,16 @@ app.post("/webhooks/orders_cancelled", async (req, res) => {
   const webhookId = req.headers["x-shopify-webhook-id"];
   if (await isWebhookDuplicate(`cancel_${webhookId}`)) return;
   logEvent('INFO', 'WEBHOOK', `Order Cancelled: ${req.body.name}`);
-  await pool.query(
-    `UPDATE orders_ops SET financial_status = 'cancelled', updated_at = NOW() WHERE id = $1`,
-    [String(req.body.id)]
-  );
+  
+  // 🟢 SAFETY NET ADDED HERE
+  try {
+    await pool.query(
+      `UPDATE orders_ops SET financial_status = 'cancelled', updated_at = NOW() WHERE id = $1`,
+      [String(req.body.id)]
+    );
+  } catch (e) {
+    logEvent('ERROR', 'WEBHOOK', 'Cancel DB Save Failed', { error: e.message });
+  }
 });
 
 app.post("/webhooks/orders_updated", async (req, res) => {
