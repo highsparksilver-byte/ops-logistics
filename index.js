@@ -1087,14 +1087,23 @@ app.get("/admin/circuit-status", async (req, res) => {
 
 app.get("/admin/force-single", async (req, res) => {
   if (!verifyAdmin(req)) return res.status(403).json({ error: "Unauthorized" });
-  const { awb } = req.query;
+  
+  // 🟢 THE FIX: We now accept an optional 'force_couriere' query parameter
+  const { awb, force_courier } = req.query; 
   if (!awb) return res.status(400).json({ error: "AWB Required" });
+  
   try {
     const r = await pool.query(`SELECT courier_source FROM shipments_ops WHERE awb = $1`, [awb]);
     if (r.rows.length === 0) return res.status(404).json({ error: "AWB not in DB" });
-    const result = await forceRefreshShipment(awb, r.rows[0].courier_source);
+    
+    // 🟢 Decide which courier to ask: use the override if provided, otherwise trust the DB
+    const courierToUse = force_courier || r.rows[0].courier_source;
+    
+    const result = await forceRefreshShipment(awb, courierToUse);
     res.json({ success: !!result, data: result });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { 
+    res.status(500).json({ error: e.message }); 
+  }
 });
 
 /* ===============================
