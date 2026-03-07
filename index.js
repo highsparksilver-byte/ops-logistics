@@ -1315,6 +1315,39 @@ async function shutdown(signal) {
 }
 
 /* ===============================
+   🕵️ ISOLATED DATABASE CABLE TEST
+================================ */
+app.get("/test-db", async (req, res) => {
+  const start = Date.now();
+  try {
+    // Attempt to grab a direct connection to Supabase
+    const client = await pool.connect();
+    
+    // Ask it the simplest question possible
+    const result = await client.query("SELECT 1 AS database_is_awake");
+    client.release();
+    
+    const latency = Date.now() - start;
+    
+    res.json({
+      success: true,
+      verdict: "SUPABASE IS HEALTHY",
+      latency_ms: latency,
+      data: result.rows
+    });
+  } catch (e) {
+    const latency = Date.now() - start;
+    res.status(500).json({
+      success: false,
+      verdict: "SUPABASE CONNECTION FAILED",
+      latency_ms: latency,
+      error_code: e.code,
+      error_message: e.message
+    });
+  }
+});
+
+/* ===============================
    🚀 STARTUP SEQUENCE
 ================================ */
 const PORT = process.env.PORT || 10000;
